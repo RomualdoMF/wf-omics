@@ -54,7 +54,7 @@ ARM processor support: False
 
 These are instructions to install and run the workflow on command line.
 You can also access the workflow via the
-[EPI2ME Desktop application](https://labs.epi2me.io/downloads/).
+[EPI2ME Desktop application](https://epi2me.nanoporetech.com/downloads/).
 
 The workflow uses [Nextflow](https://www.nextflow.io/) to manage
 compute and software resources,
@@ -74,7 +74,8 @@ parameter as exemplified below.
 It is not required to clone or download the git repository
 in order to run the workflow.
 More information on running EPI2ME workflows can
-be found on our [website](https://labs.epi2me.io/wfindex).
+be found in the
+[documentation](https://epi2me.nanoporetech.com/epi2me-docs/wfquickstart/).
 
 The following command can be used to obtain the workflow.
 This will pull the repository in to the assets folder of
@@ -110,17 +111,6 @@ nextflow run epi2me-labs/wf-human-variation \
 	-profile standard
 ```
 
-For further information about running a workflow on
-the command line see https://labs.epi2me.io/wfquickstart/
-
-
-
-
-## Related protocols
-
-This workflow is designed to take input sequences that have been produced from [Oxford Nanopore Technologies](https://nanoporetech.com/) devices.
-
-Find related protocols in the [Nanopore community](https://community.nanoporetech.com/docs/).
 
 
 
@@ -390,6 +380,14 @@ Output files may be aggregated including information for all samples or provided
 
 
 
+## Related protocols
+
+This workflow is designed to take input sequences that have been produced from [Oxford Nanopore Technologies](https://nanoporetech.com/) devices.
+
+Find related protocols in the [Nanopore community](https://community.nanoporetech.com/docs/).
+
+
+
 ## Troubleshooting
 
 + Annotations for `--snp` and `--sv` are generated using [SnpEff](https://pcingola.github.io/SnpEff/). For `--snp`, additional [ClinVar](https://www.ncbi.nlm.nih.gov/clinvar/) annotations are displayed in the report where available (please note, the report will not display any variants classified as 'Benign' or 'Likely benign', however these variants will be present in the
@@ -409,9 +407,16 @@ output VCF).
 
 ## FAQs
 
-If your question is not answered here, please report any issues or suggestions on the [github issues](https://github.com/epi2me-labs/wf-template/issues) page or start a discussion on the [community](https://community.nanoporetech.com/). 
+If your question is not answered here, please start a discussion on the [community](https://community.nanoporetech.com/). 
 
-+ *The number of SNVs and indels in the report do not sum up to the number of record, is that normal?* - Yes; this can be due to some multiallelic sites carrying a mixture of SNV and indel alleles.
+### How do I use Rerio models for SNV calling?
+
+If you wish to use cutting-edge research release models from Rerio with Clair3, follow the instructions on the [Clair3 section of the Rerio repository](https://github.com/nanoporetech/rerio#clair3-models). The download script will download and extract the model to a directory which can then be provided to the workflow's `--clair3_model_path` option. Additionally, if the basecaller configuration you are using is not known to the workflow, you must set `--override_basecaller_cfg custom`.
+
+
+### The number of SNVs and indels in the report do not sum up to the number of records, is that normal?
+
+Yes; this can be due to some multiallelic sites carrying a mixture of SNV and indel alleles.
 
 
 
