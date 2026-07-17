@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.8.1]
+This patch release of wf-human-variation adds automatic model selection for data basecalled by the v6.0.0 HAC model. 
+Users of v2.8.0 do not need to adopt this release unless they have chosen to use Dorado with v6 models.
+
+### Added
+- Clair3 HAC v6.0.0 model will be automatically selected for data basecalled with Dorado v6 models.
+- FAQ item to describe how [Rerio Clair3 models](https://github.com/nanoporetech/rerio#clair3-models) may be used with the workflow.
+### Changed
+- Updated to wf-template v5.7.1 to maintain compliance with our latest wf-template standard, changing:
+    - The README docs sections to move related protocols after inputs and outputs.
+    - Links in the README to point at our new documentation website.
+    - Our pre-commit configuration to resolve a dependency issue in our test infrastructure.
+
 ## [v2.8.0]
 This minor release of wf-human-variation updates [modkit](https://github.com/nanoporetech/modkit) to improve the performance of modkit pileup processes for the base modifications subworkflow.
 On our HG002 dataset, the per-chromosome `modkit_phase` processes run 10x faster on average while still returning the same base modifications, with some minor differences to the score and count columns.
@@ -231,15 +244,14 @@ Users are recommended to upgrade to this version to benefit from improved SV cal
 ### Changed
 - Update Spectre to v0.2.1, which generates a predicted karyotype that is included in the HTML report.
 - Improved reliability of the haplocheck process.
+- Workflow will exit early with an informative message and alignment report if there are no aligned reads in the BAM
+
 ### Fixed
 - infer_sex causing SNP subworkflow to wait unnecessarily on completion of mosdepth
 - Alignment QC report crashing due to missing unmapped histograms
 - Unsupported dna_r10.4.1_e8.2_5khz_400bps_sup@v4.2.0 model
 - Missing Clair3 mapping for v3.5.1 models
   - The missing model mapping is provided for completeness, users are strongly encouraged to re-basecall data on newer models to take advantage of significant improvements.
-
-### Changed
-- Workflow will exit early with an informative message and alignment report if there are no aligned reads in the BAM
 
 ## [v2.2.2]
 ### Changed
