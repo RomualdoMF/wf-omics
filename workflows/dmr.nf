@@ -18,29 +18,42 @@
 // is toggled, via dmr_haplotype_compare_args / dmr_sample_compare_args -- a
 // literal subset of upstream's own CLI flag vocabulary (--plot,
 // --methylartist_only, --gene_list <path>, --imprinted).
+//
+// NOTE on the 5mC/5hmC ("m"/"h") duplication below: DSL2 forbids invoking the
+// same process more than once from within a single workflow scope (calling it
+// from a `for (mod_char in ["m","h"])` loop hits "Process has already been
+// used"), so instead of looping, every process used per mod type is included
+// twice under a `_m`/`_h` alias (see the include block) and each stage's logic
+// is written out twice, once per mod type, rather than factored into a loop.
 
 include {
-    prep_dmr_bedmethyl;
+    prep_dmr_bedmethyl as prep_dmr_bedmethyl_side1_m;
+    prep_dmr_bedmethyl as prep_dmr_bedmethyl_side1_h;
+    prep_dmr_bedmethyl as prep_dmr_bedmethyl_side2_m;
+    prep_dmr_bedmethyl as prep_dmr_bedmethyl_side2_h;
     split_bedmethyl_by_chr;
     list_reference_chromosomes;
-    dmr_calling;
-    aggregate_dmrs;
+    dmr_calling as dmr_calling_m;
+    dmr_calling as dmr_calling_h;
+    aggregate_dmrs as aggregate_dmrs_m;
+    aggregate_dmrs as aggregate_dmrs_h;
     download_dmr_annotations;
-    annotate_dmrs;
+    annotate_dmrs as annotate_dmrs_m;
+    annotate_dmrs as annotate_dmrs_h;
     prepare_gene_list;
-    report_dmrs;
-    plot_dmr_modbamtools;
-    plot_dmr_methylartist;
-    plot_phased_dmr_modbamtools;
-    plot_phased_dmr_methylartist;
+    report_dmrs as report_dmrs_m;
+    report_dmrs as report_dmrs_h;
+    plot_dmr_modbamtools as plot_dmr_modbamtools_m;
+    plot_dmr_modbamtools as plot_dmr_modbamtools_h;
+    plot_dmr_methylartist as plot_dmr_methylartist_m;
+    plot_dmr_methylartist as plot_dmr_methylartist_h;
+    plot_phased_dmr_modbamtools as plot_phased_dmr_modbamtools_m;
+    plot_phased_dmr_modbamtools as plot_phased_dmr_modbamtools_h;
+    plot_phased_dmr_methylartist as plot_phased_dmr_methylartist_m;
+    plot_phased_dmr_methylartist as plot_phased_dmr_methylartist_h;
 } from '../modules/local/dmr.nf'
 
 include { sample_probs; modkit } from './methyl.nf'
-
-// The modified bases workflows/methyl.nf's modkit pileups for (see workflow mod
-// in that file, --modified-bases 5mC 5hmC) -- "m"/"h" are modkit's own bedMethyl
-// mod-code characters.
-def DMR_MOD_TYPES = ["m", "h"]
 
 // Parses the literal subset of upstream ont-methylDMR-kit CLI flags this
 // integration understands out of a raw args list
@@ -91,34 +104,62 @@ workflow dmr_haplotype_compare {
         reports = Channel.empty()
         plots = Channel.empty()
 
-        for (mod_char in DMR_MOD_TYPES) {
-            prepped1 = prep_dmr_bedmethyl(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed1) }, mod_char)
-            prepped2 = prep_dmr_bedmethyl(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed2) }, mod_char)
-            chr_pairs = prepped1.dss_bed | join(prepped2.dss_bed, by: 0)
+        // ---- 5mC ("m") ----
+        prepped1_m = prep_dmr_bedmethyl_side1_m(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed1) }, "m")
+        prepped2_m = prep_dmr_bedmethyl_side2_m(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed2) }, "m")
+        chr_pairs_m = prepped1_m.dss_bed | join(prepped2_m.dss_bed, by: 0)
 
-            dmr_out = dmr_calling(chr_pairs)
-            agg_key = alias_ch | map { alias -> tuple(alias, comparison_label, mod_char) }
-            agg_out = aggregate_dmrs(
-                agg_key,
-                dmr_out.chr_dmrs | map { chr, f -> f } | collect,
-                dmr_out.status_log | collect
-            )
-            dmr_tables = dmr_tables | mix(agg_out.dmr_table)
+        dmr_out_m = dmr_calling_m(chr_pairs_m)
+        agg_key_m = alias_ch | map { alias -> tuple(alias, comparison_label, "m") }
+        agg_out_m = aggregate_dmrs_m(
+            agg_key_m,
+            dmr_out_m.chr_dmrs | map { chr, f -> f } | collect,
+            dmr_out_m.status_log | collect
+        )
+        dmr_tables = dmr_tables | mix(agg_out_m.dmr_table)
 
-            ann_out = annotate_dmrs(agg_out.dmr_table, annotations_ready, flags.imprinted)
-            annotated_tables = annotated_tables | mix(ann_out.annotated)
+        ann_out_m = annotate_dmrs_m(agg_out_m.dmr_table, annotations_ready, flags.imprinted)
+        annotated_tables = annotated_tables | mix(ann_out_m.annotated)
 
-            rep_out = report_dmrs(ann_out.annotated, ann_out.annotation_log)
-            reports = reports | mix(rep_out.report)
+        rep_out_m = report_dmrs_m(ann_out_m.annotated, ann_out_m.annotation_log)
+        reports = reports | mix(rep_out_m.report)
 
-            if (flags.plot) {
-                if (!flags.methylartist_only) {
-                    mb = plot_phased_dmr_modbamtools(ann_out.annotated, gencode_annotation.collect(), gene_list.collect(), phased_bam.collect())
-                    plots = plots | mix(mb.dmr_plots)
-                }
-                ma = plot_phased_dmr_methylartist(ann_out.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), phased_bam.collect())
-                plots = plots | mix(ma.dmr_plots)
+        if (flags.plot) {
+            if (!flags.methylartist_only) {
+                mb_m = plot_phased_dmr_modbamtools_m(ann_out_m.annotated, gencode_annotation.collect(), gene_list.collect(), phased_bam.collect())
+                plots = plots | mix(mb_m.dmr_plots)
             }
+            ma_m = plot_phased_dmr_methylartist_m(ann_out_m.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), phased_bam.collect())
+            plots = plots | mix(ma_m.dmr_plots)
+        }
+
+        // ---- 5hmC ("h") ----
+        prepped1_h = prep_dmr_bedmethyl_side1_h(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed1) }, "h")
+        prepped2_h = prep_dmr_bedmethyl_side2_h(paired.map { sq, alias, bed1, bed2 -> tuple(sq, bed2) }, "h")
+        chr_pairs_h = prepped1_h.dss_bed | join(prepped2_h.dss_bed, by: 0)
+
+        dmr_out_h = dmr_calling_h(chr_pairs_h)
+        agg_key_h = alias_ch | map { alias -> tuple(alias, comparison_label, "h") }
+        agg_out_h = aggregate_dmrs_h(
+            agg_key_h,
+            dmr_out_h.chr_dmrs | map { chr, f -> f } | collect,
+            dmr_out_h.status_log | collect
+        )
+        dmr_tables = dmr_tables | mix(agg_out_h.dmr_table)
+
+        ann_out_h = annotate_dmrs_h(agg_out_h.dmr_table, annotations_ready, flags.imprinted)
+        annotated_tables = annotated_tables | mix(ann_out_h.annotated)
+
+        rep_out_h = report_dmrs_h(ann_out_h.annotated, ann_out_h.annotation_log)
+        reports = reports | mix(rep_out_h.report)
+
+        if (flags.plot) {
+            if (!flags.methylartist_only) {
+                mb_h = plot_phased_dmr_modbamtools_h(ann_out_h.annotated, gencode_annotation.collect(), gene_list.collect(), phased_bam.collect())
+                plots = plots | mix(mb_h.dmr_plots)
+            }
+            ma_h = plot_phased_dmr_methylartist_h(ann_out_h.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), phased_bam.collect())
+            plots = plots | mix(ma_h.dmr_plots)
         }
     emit:
         dmr_table = dmr_tables
@@ -147,8 +188,8 @@ workflow dmr_sample_compare {
 
         // Reference side, raw (unfiltered by mod code) per-chromosome bedmethyl --
         // converges both branches to the same shape (tuple(chr, raw_bedmethyl))
-        // consumed by prep_dmr_bedmethyl below, same as prep_dmr_bedmethyl does
-        // for the sample side.
+        // consumed by prep_dmr_bedmethyl_side2_* below, same as
+        // prep_dmr_bedmethyl_side1_* does for the sample side.
         def reference_available_for_plotting = is_bam
         if (is_bam) {
             def idx_ext = lower_ref.endsWith('.cram') ? '.crai' : '.bai'
@@ -198,37 +239,64 @@ workflow dmr_sample_compare {
             log.warn "dmr_sample_compare: --plot requested but ${reference_path} is a bedmethyl, not a BAM/CRAM -- skipping plots (no reads to plot for the reference side)."
         }
 
-        for (mod_char in DMR_MOD_TYPES) {
-            sample_prepped = prep_dmr_bedmethyl(sample_keyed.map { sq, alias, bed -> tuple(sq, bed) }, mod_char)
-            ref_prepped = prep_dmr_bedmethyl(reference_keyed, mod_char)
-            chr_pairs = sample_prepped.dss_bed | join(ref_prepped.dss_bed, by: 0)
+        // ---- 5mC ("m") ----
+        sample_prepped_m = prep_dmr_bedmethyl_side1_m(sample_keyed.map { sq, alias, bed -> tuple(sq, bed) }, "m")
+        ref_prepped_m = prep_dmr_bedmethyl_side2_m(reference_keyed, "m")
+        chr_pairs_m = sample_prepped_m.dss_bed | join(ref_prepped_m.dss_bed, by: 0)
 
-            dmr_out = dmr_calling(chr_pairs)
-            agg_key = alias_ch | map { alias -> tuple(alias, comparison_label, mod_char) }
-            agg_out = aggregate_dmrs(
-                agg_key,
-                dmr_out.chr_dmrs | map { chr, f -> f } | collect,
-                dmr_out.status_log | collect
-            )
-            dmr_tables = dmr_tables | mix(agg_out.dmr_table)
+        dmr_out_m = dmr_calling_m(chr_pairs_m)
+        agg_key_m = alias_ch | map { alias -> tuple(alias, comparison_label, "m") }
+        agg_out_m = aggregate_dmrs_m(
+            agg_key_m,
+            dmr_out_m.chr_dmrs | map { chr, f -> f } | collect,
+            dmr_out_m.status_log | collect
+        )
+        dmr_tables = dmr_tables | mix(agg_out_m.dmr_table)
 
-            ann_out = annotate_dmrs(agg_out.dmr_table, annotations_ready, flags.imprinted)
-            annotated_tables = annotated_tables | mix(ann_out.annotated)
+        ann_out_m = annotate_dmrs_m(agg_out_m.dmr_table, annotations_ready, flags.imprinted)
+        annotated_tables = annotated_tables | mix(ann_out_m.annotated)
 
-            rep_out = report_dmrs(ann_out.annotated, ann_out.annotation_log)
-            reports = reports | mix(rep_out.report)
+        rep_out_m = report_dmrs_m(ann_out_m.annotated, ann_out_m.annotation_log)
+        reports = reports | mix(rep_out_m.report)
 
-            if (flags.plot && reference_available_for_plotting) {
-                // ref_bam_ch was built above, inside the `if (is_bam)` branch --
-                // in scope here since reference_available_for_plotting == is_bam.
-                ref_bam_for_plot = ref_bam_ch | map { meta, xam, xai -> tuple(meta.alias, xam, xai) }
-                if (!flags.methylartist_only) {
-                    mb = plot_dmr_modbamtools(ann_out.annotated, gencode_annotation.collect(), gene_list.collect(), sample_bam.collect(), ref_bam_for_plot.collect())
-                    plots = plots | mix(mb.dmr_plots)
-                }
-                ma = plot_dmr_methylartist(ann_out.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), sample_bam.collect(), ref_bam_for_plot.collect())
-                plots = plots | mix(ma.dmr_plots)
+        if (flags.plot && reference_available_for_plotting) {
+            ref_bam_for_plot = ref_bam_ch | map { meta, xam, xai -> tuple(meta.alias, xam, xai) }
+            if (!flags.methylartist_only) {
+                mb_m = plot_dmr_modbamtools_m(ann_out_m.annotated, gencode_annotation.collect(), gene_list.collect(), sample_bam.collect(), ref_bam_for_plot.collect())
+                plots = plots | mix(mb_m.dmr_plots)
             }
+            ma_m = plot_dmr_methylartist_m(ann_out_m.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), sample_bam.collect(), ref_bam_for_plot.collect())
+            plots = plots | mix(ma_m.dmr_plots)
+        }
+
+        // ---- 5hmC ("h") ----
+        sample_prepped_h = prep_dmr_bedmethyl_side1_h(sample_keyed.map { sq, alias, bed -> tuple(sq, bed) }, "h")
+        ref_prepped_h = prep_dmr_bedmethyl_side2_h(reference_keyed, "h")
+        chr_pairs_h = sample_prepped_h.dss_bed | join(ref_prepped_h.dss_bed, by: 0)
+
+        dmr_out_h = dmr_calling_h(chr_pairs_h)
+        agg_key_h = alias_ch | map { alias -> tuple(alias, comparison_label, "h") }
+        agg_out_h = aggregate_dmrs_h(
+            agg_key_h,
+            dmr_out_h.chr_dmrs | map { chr, f -> f } | collect,
+            dmr_out_h.status_log | collect
+        )
+        dmr_tables = dmr_tables | mix(agg_out_h.dmr_table)
+
+        ann_out_h = annotate_dmrs_h(agg_out_h.dmr_table, annotations_ready, flags.imprinted)
+        annotated_tables = annotated_tables | mix(ann_out_h.annotated)
+
+        rep_out_h = report_dmrs_h(ann_out_h.annotated, ann_out_h.annotation_log)
+        reports = reports | mix(rep_out_h.report)
+
+        if (flags.plot && reference_available_for_plotting) {
+            ref_bam_for_plot_h = ref_bam_ch | map { meta, xam, xai -> tuple(meta.alias, xam, xai) }
+            if (!flags.methylartist_only) {
+                mb_h = plot_dmr_modbamtools_h(ann_out_h.annotated, gencode_annotation.collect(), gene_list.collect(), sample_bam.collect(), ref_bam_for_plot_h.collect())
+                plots = plots | mix(mb_h.dmr_plots)
+            }
+            ma_h = plot_dmr_methylartist_h(ann_out_h.annotated, gencode_annotation.collect(), gene_list.collect(), reference.collect(), sample_bam.collect(), ref_bam_for_plot_h.collect())
+            plots = plots | mix(ma_h.dmr_plots)
         }
     emit:
         dmr_table = dmr_tables
