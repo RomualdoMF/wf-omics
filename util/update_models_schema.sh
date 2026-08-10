@@ -8,24 +8,8 @@ set -euo pipefail
 LC_ALL=C
 
 TARGET=$1
-ENGINE=$2
 
-if ! command -v nextflow &> /dev/null
-then
-    # we should be in CI, nextflow is installed right here
-    NEXTFLOW="./nextflow"
-else
-    NEXTFLOW=`which nextflow`
-fi
-
-# work out how to inspect the container contents
-DORADO_CONTAINER="nanoporetech/dorado:latest"
-echo "# DORADO_CONTAINER=${DORADO_CONTAINER}"
-if [ "$ENGINE" = "simg" ]; then
-    CMD_PREFIX="singularity exec docker://${DORADO_CONTAINER}"
-else
-    CMD_PREFIX="docker run ${DORADO_CONTAINER}"
-fi
+get_artifactory "${WHALEFISH_ARTIFACTORY_METADATA_ROOT}/dorado/latest/models.json"
 
 # Get basecaller_cfg with a valid Clair3 model
 # CW-4166 Note we skip including khz models which are synonymous with the model name without the distinction ... for now
@@ -33,8 +17,8 @@ awk 'NR>1 && $1 == "dorado" && $3 != "-" {print $2}' data/clair3_models.tsv | gr
 awk 'NR>1 && $1 == "dorado" && $3 == "-" {print $2}' data/clair3_models.tsv | grep -v khz_ | sort | uniq > invalid_clair3_dorado_models.ls
 awk 'NR>1 && $1 != "dorado" && $3 != "-" {print $2}' data/clair3_models.tsv | sort | uniq > valid_clair3_nondorado_models.ls
 
-# Get basecaller_cfg with a valid Dorado model in the container (should be sorted but lets be sure)
-${CMD_PREFIX} list-models --simplex --only-names | grep -v '^rna' | sort > simplex_models.ls
+# Get basecaller_cfg with a valid Dorado model in models.json (should be sorted but lets be sure)
+jq -r '.simplex[] | select(startswith("rna") | not)' models.json | sort > simplex_models.ls
 comm -12 valid_clair3_dorado_models.ls simplex_models.ls > basecalling_models.ls # basecalling models WITH a clair3 model
 
 cat valid_clair3_dorado_models.ls invalid_clair3_dorado_models.ls | sort > mentioned_dorado_models.ls
@@ -48,9 +32,7 @@ comm -23 valid_clair3_dorado_models.ls simplex_models.ls | cat - valid_clair3_no
 
 # Convert model lists to JSON arrays
 SIMPLEX_MODELS=$(cat simplex_models.ls | sed '$a\custom' | cat - clair3_only_models.ls | jq -Rn '[inputs]')
-MODBASE_MODELS=$(${CMD_PREFIX} list-models --modbase --only-names | sed '$a\custom' | jq -Rn '[inputs]')
 
-# Inject JSON arrays to relevant schema enum
 jq \
     -j \
     --indent 4 \
@@ -58,6 +40,13 @@ jq \
     '(.definitions.advanced_options.properties.override_basecaller_cfg.enum) = $simplex_models' \
     ${TARGET}/nextflow_schema.json > ${TARGET}/nextflow_schema.json.new
 
-echo "# Updated schema generated, you should inspect it before adopting it!"
-echo "diff ${TARGET}/nextflow_schema.json ${TARGET}/nextflow_schema.json.new"
-echo "mv ${TARGET}/nextflow_schema.json.new ${TARGET}/nextflow_schema.json"
+echo "----------------------------------------------------------------------------------------"
+if ! diff -b nextflow_schema.json nextflow_schema.json.new; then
+    echo "----------------------------------------------------------------------------------------"
+    echo "Model schema requires updating."
+    echo "Inspect the diff before amending."
+    echo "To amend nextflow_schema.json, copy the diff from the logs and run patch -p0 <DIFF>"
+    exit 1
+else
+    echo "nextflow_schema.json matches available models for latest dorado container."
+fi

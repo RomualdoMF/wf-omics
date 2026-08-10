@@ -1,0 +1,858 @@
+# wf-omics — pipeline Nextflow derivado do wf-human-variation (VEP no lugar de SnpEff/SnpSift + AnnotSV)
+
+## Objetivo do projeto
+Pipeline em Nextflow, baseado no [epi2me-labs/wf-human-variation](https://github.com/epi2me-labs/wf-human-variation),
+rodando em `/mnt/d/wf-omics/`. Modificações feitas até agora:
+1. Substituir a etapa de anotação SnpEff/SnpSift pelo
+   [Ensembl VEP](https://github.com/Ensembl/ensembl-vep) (imagem oficial
+   `ensemblorg/ensembl-vep` do Docker Hub), com os parâmetros do VEP (pasta de cache,
+   pasta de plugins, `--custom`, etc.) configuráveis via `nextflow.config`.
+   **Status: implementado e testado com dados reais** (ver "Validação" abaixo).
+2. Adicionar [AnnotSV](https://github.com/lgmgeo/AnnotSV) (anotação/ranking de SVs) rodando
+   sobre o `.wf_sv.vcf.gz` já anotado pelo VEP, com container próprio
+   (`docker/annotsv/Dockerfile`, publicado no Docker Hub) e pasta de anotação humana
+   configurável, baixada automaticamente no primeiro uso.
+   **Status: implementado; imagem `romualdomf/annotsv:3.5.10` publicada no Docker Hub e
+   confirmada lá (build testado com `AnnotSV -help`/`-version`) — a integração no
+   pipeline em si (o Nextflow chamando a imagem de verdade) ainda não foi testada de
+   ponta a ponta, ver seção AnnotSV abaixo.**
+
+## Decisão: fork vs. projeto novo
+
+**Escolhido: fork** (clone local com remote `upstream` apontando para o repositório
+original), em vez de começar um repositório do zero.
+
+Motivos:
+- `wf-human-variation` é um pipeline nf-core-like grande e maduro: subworkflows, módulos,
+  containers, schema de parâmetros, perfis (docker/singularity/local/AWS), testes, docs.
+  Reescrever isso do zero seria desperdício de esforço para uma mudança pontual.
+- A mudança pedida (trocar uma etapa de anotação) é uma modificação localizada, não uma
+  reescrita — é exatamente o caso de uso de um fork.
+- Manter um remote `upstream` permite trazer correções/atualizações futuras do projeto
+  original (`git fetch upstream` + merge/rebase) sem precisar reaplicar tudo manualmente.
+- Preserva histórico e atribuição de autoria.
+
+**Atenção à licença**: o repositório usa a *Oxford Nanopore Technologies PLC Public
+License v1.0* (baseada na MPL 2.0, mas com termos próprios da ONT), não uma licença
+permissiva simples tipo MIT. Antes de redistribuir ou publicar o fork publicamente,
+vale reler os termos dessa licença.
+
+### Setup do git
+```
+/mnt/d/wf-omics/            # clone completo do wf-human-variation
+  remote: upstream = https://github.com/epi2me-labs/wf-human-variation.git (fetch)
+  remote: upstream push = DISABLE (evita push acidental pro repo original)
+  branch atual: vep-integration (criada a partir de master)
+```
+Quando quiser um backup remoto, criar um repositório vazio (GitHub/GitLab/etc.) e
+adicionar como `origin`:
+```
+git remote add origin <url-do-seu-repo>
+git push -u origin vep-integration
+```
+(não foi feito automaticamente porque não há `gh` CLI autenticado neste ambiente e a
+criação de um repositório remoto é uma ação que o usuário deve confirmar/possuir).
+
+## O que foi implementado
+
+**Importante**: a primeira versão desta migração usava um VCF de ClinVar próprio
+(`bcftools annotate` / VEP `--custom`) para repor os campos `CLNSIG`/`CLNDN`/etc. Isso foi
+**revertido a pedido do usuário**: o pipeline não baixa nem usa nenhum VCF de ClinVar
+externo. A tabela de significância clínica do relatório usa exclusivamente as anotações
+*padrão* do VEP (`CLIN_SIG`, agregada pela própria Ensembl a partir de ClinVar e outras
+fontes dentro do cache já baixado) e `SIFT`, habilitadas com `--check_existing --sift b`
+— nenhum arquivo extra, nenhum mount extra, nenhum download extra além do cache/plugins
+do próprio VEP.
+
+### Arquivos alterados/criados
+- **`modules/local/vep.nf`** (novo) — todo o código da anotação VEP:
+  - `process download_vep_cache` — garante que `params.vep_cache_dir` tem o
+    species/assembly/version pedido, baixando via `INSTALL.pl` (instalador embutido na
+    própria imagem VEP) se faltar. Idempotente: se já existir, é um no-op quase instantâneo
+    (apenas um `[ -d ... ]` dentro do container). Usa um lock via `mkdir` no próprio
+    diretório compartilhado (não em work-dir isolado) para não corromper nada se
+    snp/cnv/sv pedirem o mesmo cache ao mesmo tempo.
+  - `process download_vep_plugins` — mesma lógica, para `params.vep_plugins_dir`.
+  - `process prepare_annotation_input` — separa por contig (caso do SNP, para
+    paralelizar) ou passa o VCF inteiro adiante (caso `*` do SV/CNV). Ao contrário do
+    SnpEff original, **não** faz mais o hack `chrM`→`chrMT`: o cache VEP da Ensembl já
+    resolve sinônimos de nomes de cromossomo (`chr1`/`1`, `chrM`/`MT`) automaticamente.
+  - `process run_vep` — roda o `vep` de fato (rótulo `vep_annotation`, container
+    `ensemblorg/ensembl-vep`), com `--check_existing --sift b` para popular `CLIN_SIG`/
+    `SIFT` no CSQ, e já produz e indexa (`tabix`) o VCF final publicado
+    (`<amostra>.wf_<label>.vcf.gz`) — não há mais um passo separado de ClinVar depois.
+    Passthrough sem anotar para builds que não são hg19/hg38 (mesmo comportamento do
+    SnpEff original).
+  - `workflow annotate_vcf` — compõe `prepare_annotation_input` → `run_vep` com a mesma
+    assinatura (take/emit) do processo original `annotate_vcf` de `modules/local/common.nf`,
+    então **nenhum call site precisou mudar a forma como chama** (`main.nf`,
+    `workflows/wf-human-cnv.nf`, `workflows/wf-human-sv.nf` só trocaram de onde importam
+    `annotate_vcf`).
+  - **Não existem mais** `annotate_clinvar_info` nem `sift_clinvar_vcf` — não há mais VCF
+    filtrado/só-de-ClinVar publicado; o único VCF de saída é o VCF completo anotado pelo
+    VEP.
+- **`modules/local/common.nf`** — processo antigo `annotate_vcf` removido (substituído
+  por um comentário apontando para `vep.nf`).
+- **`base.config`** — `params.wf.snpeff_tag` → `params.wf.vep_tag = "release_116.0"`;
+  label `snpeff_annotation` → `vep_annotation` (container `ensemblorg/ensembl-vep`, no
+  bloco padrão e no bloco `awsbatch`, mesmo padrão dos outros containers). Bind mounts do
+  cache/plugins adicionados via `containerOptions` **dentro de cada profile** (`standard`
+  usa `-v host:host`, `singularity` usa `-B host:host`), no mesmo padrão já usado ali para
+  o `--gpus all` / `--nv` do label `gpu`. Os `containerOptions` são uma *closure*
+  (`{ "..." }`), não uma string direta — necessário porque `base.config` é incluído no
+  topo do `nextflow.config`, antes do bloco `params` onde `vep_cache_dir`/`vep_plugins_dir`
+  são definidos; uma string interpolada diretamente veria esses parâmetros como `null`
+  (mesmo motivo pelo qual o bloco `awsbatch` já usava closures para `aws_image_prefix`).
+  (Nota técnica: arquivos `.config` do Nextflow usam uma gramática Groovy bem mais
+  restrita que arquivos `.nf` normais — não aceitam `def function(){}` nem declaração de
+  variável solta fora de blocos de config; só funcionou como atribuição de closure
+  (`process."...".containerOptions = { ... }`) com lógica simples dentro.)
+- **`nextflow.config`** — novo bloco de parâmetros do VEP:
+  ```groovy
+  vep_species = "homo_sapiens"
+  vep_cache_version = 116
+  vep_cache_dir = "/mnt/d/vep/vep_cache"
+  vep_plugins_dir = "/mnt/d/vep/vep_cache/plugins"
+  vep_install_plugins = "all"
+  vep_custom_args = []
+  vep_plugin_args = []
+  vep_extra_args = ""
+  ```
+  (Não há `clinvar_vcf_grch38`/`clinvar_vcf_grch37` — removidos junto com a reversão do
+  ClinVar customizado.)
+  Os defaults de `vep_cache_dir`/`vep_plugins_dir` apontam para dados que já existem
+  nesta máquina — **por enquanto**, conforme pedido. Qualquer outra pessoa que clonar o
+  repo deve sobrescrever esses dois (ex.: para uma pasta vazia), e o mecanismo de
+  auto-download cuida do resto (ver abaixo).
+  `nextflow_schema.json` **não** foi atualizado com esses parâmetros (só aparecem com
+  `--show_hidden_params`... na verdade nem aparecem lá, porque não estão registrados no
+  schema — isso não quebra `validate_params` porque o schema deste repo não usa
+  `additionalProperties: false`, e já existe precedente disso com o parâmetro `store_dir`,
+  que também não está no schema). Registrar um grupo `vep_options` no schema fica como
+  possível próximo passo caso o formulário do epi2meLabs Desktop/GUI precise listar esses
+  campos.
+- **`bin/workflow_glue/report_snp.py`** — a seção de ClinVar do relatório HTML foi
+  reescrita para ler `CLIN_SIG`/`SIFT` diretamente do campo `CSQ` do VCF completo anotado
+  pelo VEP (não existe mais um VCF só-de-ClinVar separado):
+  - `parse_vep_csq_format(vcf_header)` — lê a lista ordenada de subcampos do CSQ a partir
+    do próprio header do VCF (`##INFO=<ID=CSQ,...Format: A|B|C|...>`), robusto a mudanças
+    de versão/flags do VEP em vez de assumir posições fixas.
+  - `load_clin_sig_variants(vcf_fn, sample_name, benign=False)` — para cada variante,
+    percorre os blocos de transcrito do CSQ (um por transcrito, separados por vírgula) até
+    achar um com `CLIN_SIG` preenchido (o valor é igual em todos os blocos da mesma
+    variante), monta uma linha com Gene(s) (linkado ao Ensembl, usando o `Gene`/`SYMBOL`
+    do próprio CSQ), Significance, SIFT, Consequence, HGVSc/HGVSp e Existing variation
+    (rsID/COSV etc.), e por padrão **exclui variantes "benign"** — mesmo comportamento do
+    código antigo. Ordena por significância clínica (Pathogenic primeiro) do mesmo jeito
+    que antes.
+  - `--clinvar_vcf` virou `--annotated_vcf` no argparse (e no `makeReport` process em
+    `modules/local/wf-human-snp.nf`, e no `take:` do workflow `report_snp` em
+    `workflows/wf-human-snp.nf`) — o nome antigo seria enganoso agora que o argumento é o
+    VCF completo, não um VCF filtrado só de ClinVar.
+- **`main.nf`** — no bloco de anotação do SNP, a chamada a `sift_clinvar_snp_vcf` foi
+  removida; a variável (renomeada de `clinvar_vcf` para `annotated_vcf`) agora é
+  simplesmente o VCF completo já concatenado (`snp_vcf`, mapeado para só o caminho do
+  arquivo) — sem VCF adicional gerado.
+
+### Como funciona o auto-download do cache/plugins para um novo usuário
+`download_vep_cache`/`download_vep_plugins` sempre rodam (uma vez por chamada de
+`annotate_vcf`, ou seja, até 3x por execução se snp+cnv+sv estiverem todos ativos — cada
+uma barata/instantânea se o alvo já existe). Dentro do container:
+1. Se o diretório alvo (`vep_cache_dir/homo_sapiens/116_GRCh38` ou o conteúdo de
+   `vep_plugins_dir`) já existe, não faz nada.
+2. Senão, tenta um lock via `mkdir` (atômico) no próprio diretório compartilhado
+   (bind-mounted, então visível de qualquer task) para evitar duas downloads
+   concorrentes corromperem o mesmo destino; quem não pegar o lock espera e reusa o
+   resultado de quem pegou.
+3. Roda `perl /opt/vep/src/ensembl-vep/INSTALL.pl --AUTO c|p ...` (o instalador que já
+   vem dentro da própria imagem VEP) apontando `--CACHEDIR`/`--PLUGINSDIR` diretamente
+   para o diretório host bind-mounted.
+
+## Validação feita
+Não foi possível rodar o pipeline completo de ponta a ponta (chamada de variantes real via
+Clair3 é lenta e exigiria os dados demo de ~140MB do próprio wf-human-variation, o que
+levaria bem mais tempo do que esta sessão permite). Em vez disso:
+- `nextflow config` confirmou que `base.config`/`nextflow.config` resolvem sem erros.
+- `NXF_VER=23.10.1 nextflow run main.nf --help` compilou o grafo DSL2 inteiro (todos os
+  `include`, assinaturas take/emit) sem erros de sintaxe. (Nextflow 26.x, a versão
+  instalada por padrão nesta máquina, não roda mais este pipeline mesmo sem minhas
+  mudanças — o `main.nf` original usa `for` clássico, removido no parser novo; por isso os
+  testes usam `NXF_VER=23.10.1`, compatível com `manifest.nextflowVersion = '>=23.04.2'`.)
+- Teste funcional isolado: um script Nextflow separado (fora do repo) importou
+  `annotate_vcf` de `modules/local/vep.nf` diretamente e rodou contra 200 variantes reais
+  (extraídas de um VCF de ClinVar só como *fonte de coordenadas* hg38 reais para o teste,
+  não como entrada do pipeline) usando o cache já existente em `/mnt/d/vep`. Resultado:
+  197 das 200 variantes ganharam `CLIN_SIG` (nativo, vindo só do cache), confirmando que
+  `--check_existing --sift b` funciona sem nenhum arquivo/mount extra.
+- `load_clin_sig_variants` (a função nova do `report_snp.py`) foi testada diretamente
+  (fora do container) contra o VCF anotado real: das 197 variantes com `CLIN_SIG`, a
+  função corretamente excluiu as "benign"/"likely_benign" e devolveu uma tabela com as 5
+  variantes patogênicas/provavelmente patogênicas, com link de gene pro Ensembl,
+  significância e ordenação corretas.
+- Também foi validado (antes da reversão do ClinVar customizado, mas o mecanismo de
+  download em si não mudou) que o auto-download funciona de verdade: apontando
+  `vep_plugins_dir` para uma pasta vazia, `download_vep_plugins` baixou um plugin real
+  (`CADD.pm`) via `INSTALL.pl`. Isso pegou e corrigiu um bug real: o lock (`mkdir`) do
+  download de plugins estava num caminho *irmão* de `vep_plugins_dir`, fora da pasta
+  bind-mounted no container — o `mkdir` falhava sempre e o processo ficava preso num loop
+  `sleep 5` infinito. Corrigido movendo o lock para *dentro* de `vep_plugins_dir`
+  (`.download.lock`, dotfile) e ignorando entradas ocultas na checagem de "já populado".
+- O caminho de auto-download do **cache** (multi-GB) não foi testado do zero por ser
+  grande demais para esta sessão — só o caminho "já existe, pula" foi validado — mas usa
+  exatamente o mesmo padrão de lock (dentro do próprio diretório bind-mounted) já
+  comprovado para os plugins.
+
+## AnnotSV (anotação/ranking de SVs)
+
+[AnnotSV](https://github.com/lgmgeo/AnnotSV) roda em cima do `.wf_sv.vcf.gz` (já anotado
+pelo VEP) e produz uma tabela TSV com anotação/ranking de patogenicidade de SVs. Não
+existe imagem Docker oficial do AnnotSV — o repositório nem tem um `Dockerfile` — então
+essa imagem precisou ser construída e publicada do zero.
+
+### Container: `docker/annotsv/Dockerfile`
+- Base `debian:bookworm-slim` + dependências do core Tcl/Tk do AnnotSV (`tcl8.6`/`tk8.6`,
+  `bedtools`, `bcftools`, `openjdk-17-jre-headless`). **Sem Python** — ver "variantconvert
+  removido" abaixo.
+- Clona `https://github.com/lgmgeo/AnnotSV` na tag `v3.5.10` e roda
+  `make PREFIX=. install` **dentro** de `/opt/AnnotSV` (instalação "in-place", igual ao
+  `share/doc/AnnotSV/quickstart.md` do próprio projeto — não copia nada para `/usr/local`,
+  usa a própria árvore clonada como `$ANNOTSV`).
+- **Não** roda `make install-human-annotation` — a anotação humana (~5GB) fica de fora da
+  imagem de propósito, igual ao cache do VEP: é baixada à parte, no host, e montada em
+  runtime (ver abaixo).
+- Bug real encontrado e corrigido durante o build: o Makefile do AnnotSV chama `tclsh`
+  (sem sufixo de versão) pra detectar a versão do Tcl instalado; o pacote Debian
+  `tcl8.6` só fornece `tclsh8.6`, então esse `tclsh` "puro" não existia, e o Makefile
+  silenciosamente detectava uma versão vazia, o que fazia o alvo `install-documentationlight`
+  tentar mover `share/tcl` para dentro de si mesmo (`share/tcl/tcl`) e falhar. Corrigido
+  com `ln -sf "$(command -v tclsh8.6)" /usr/bin/tclsh` no Dockerfile.
+- Build testado: `AnnotSV -help`/`-version` funcionam, reportam
+  `Application name used: /opt/AnnotSV` (confirma que a instalação in-place + `$ANNOTSV`
+  estão corretos), `bcftools`/`bedtools` presentes.
+- **`variantconvert` removido de vez** (histórico: primeiro tentei consertar, depois o
+  usuário pediu pra tirar de vez). `variantconvert` é o que o Makefile do AnnotSV instala
+  (target `install-variantconvert`, sem flag pra pular) pra dar suporte a `-vcf 1` (saída
+  nativa em VCF). Achamos dois problemas em sequência: (1) o `pip3 install -e ...` que
+  esse target roda falhava silenciosamente no Debian bookworm sem `--break-system-packages`
+  (PEP 668) — corrigido temporariamente com `ENV PIP_BREAK_SYSTEM_PACKAGES=1`; (2) mesmo
+  instalado, `-vcf 1` continuou **quebrado de verdade**: gerava um `.vcf` só com header,
+  sem linha `#CHROM` nem registros, em todo `-variantconvertMode` testado (inclusive depois
+  de corrigir um `pandas.errors.LossySetitemError` separado fixando `pandas==2.2.3`).
+  Diante disso o usuário pediu pra tirar `variantconvert` do Dockerfile de vez, já que o
+  pipeline passou a gerar seu próprio VCF anotado por outro caminho (ver
+  `annotate_vcf_with_tsv`/`bin/annotate_vcf_from_annotsv.py` abaixo) — então não tem mais
+  razão pra manter Python/pip na imagem nenhuma. Removidos `python3`/`python3-pip`,
+  `PIP_BREAK_SYSTEM_PACKAGES` e o `pip3 install pyfaidx natsort pandas tqdm polars appdirs`
+  do Dockerfile. O `install-variantconvert` do Makefile do AnnotSV continua rodando (não
+  tem como pular só esse sub-target sem tocar no Makefile) — ele clona o repo do
+  `variantconvert` (git não precisa de Python) e tenta `pip3 install -e ...`, que agora
+  falha com "command not found" (sem Python/pip na imagem); o próprio Makefile já trata
+  essa falha como não-fatal (cai em cascata `pip3 || pip || python -m pip || rm -f
+  pipinstall.flag`), então `make install` termina com sucesso mesmo assim, só imprimindo
+  "variantconvert not installed". O clone (não instalado, só a fonte) é removido em seguida
+  com `rm -rf share/python3/variantconvert` pra não carregar peso à toa. Confirmado com
+  `docker run ... which python3 python pip3` (vazio) e `AnnotSV -help` funcionando normal.
+- Imagem: **`romualdomf/annotsv:3.5.10`** (`linux/amd64`), publicada no Docker Hub — várias
+  reconstruções nesta sessão (fix do `tclsh`, `procps`, tentativa de consertar
+  `variantconvert`, remoção final do Python), sempre no mesmo tag/nome (o digest muda a
+  cada rebuild real). Pushes pra este repositório sofreram repetidamente de rede lenta
+  entre este ambiente e o backend AWS/S3 do Docker Hub (throughput caindo bem abaixo do
+  normal em vários momentos) — em nenhum caso era travamento de verdade, só throughput
+  baixo (confirmado via `ss -tni`, olhando `bytes_acked` crescendo devagar mas de forma
+  consistente); a camada grande do `apt-get`/base fica cacheada no registry entre pushes,
+  então só as camadas que mudam (o `RUN git clone && make install`) precisam reenviar de
+  fato.
+
+### Integração no pipeline
+- **`modules/local/annotsv.nf`** (novo):
+  - `process download_annotsv_annotations` — mesmíssimo padrão de
+    `download_vep_cache`/`download_vep_plugins` (idempotente, lock via `mkdir` dentro do
+    próprio diretório bind-mounted): baixa
+    `https://www.lbgi.fr/~geoffroy/Annotations/Annotations_Human_<versão>.tar.gz`
+    (confirmei via download parcial que o tarball já vem com `Annotations_Human/` como
+    diretório de topo) e extrai direto em `params.annotsv_annotations_dir`, resultando em
+    `params.annotsv_annotations_dir/Annotations_Human/...` — exatamente a estrutura que a
+    flag `-annotationsDir` do AnnotSV espera.
+  - `process run_annotsv` — roda
+    `AnnotSV -SVinputFile ... -outputDir . -outputFile <amostra>.wf_<label>.annotsv.tsv
+    -genomeBuild GRCh38|GRCh37 -annotationsDir <dir> -overwrite 1 <custom_args>`, onde
+    `<label>` é `sv` ou `cnv` (parâmetro `output_label`, mesma ideia do `output_label` do
+    `annotate_vcf` do VEP) — produz `<amostra>.wf_sv.annotsv.tsv` ou
+    `<amostra>.wf_cnv.annotsv.tsv`. `<custom_args>` vem de `params.annotsv_sv_custom_args`
+    / `params.annotsv_cnv_custom_args` (listas de tokens crus, `[]` por padrão nas duas —
+    ex. `["-hpo", "HP:0001156"]`; passar `["-vcf", "1"]` não tem mais efeito nenhum, já que
+    `variantconvert` foi removido da imagem, ver acima). Sem `publishDir` próprio — o TSV
+    entra no mesmo canal `report`/`artifacts` que o resto da saída de SV/CNV, publicado via
+    `output_sv`/`output_cnv` (mesma convenção já usada pro VCF anotado pelo VEP). Pulado
+    (output `optional: true`) para genome builds que não são hg19/hg38.
+  - `workflow annotsv` — compõe os dois processos acima, recebendo `output_label` como
+    terceiro parâmetro e repassando adiante. Emite só `annotsv_tsv` — a geração do VCF
+    anotado (ver `annotate_vcf_with_tsv` logo abaixo) fica fora dessa workflow de propósito,
+    porque o caminho CNV precisa injetar o TSV *depois* do ensemble ISV/ClassifyCNV (ver
+    seção "Ensemble de classificação de CNV"), não o TSV cru do AnnotSV — se
+    `annotate_vcf_with_tsv` rodasse dentro de `workflow annotsv`, o CNV acabaria sendo
+    anotado duas vezes (uma vez incompleta aqui, outra completa depois).
+  - `process annotate_vcf_with_tsv` (label `wf_common`) — escreve as colunas de uma tabela
+    derivada do AnnotSV de volta no VCF original como campos INFO, via
+    `bin/annotate_vcf_from_annotsv.py` (script novo, só depende de `pysam` — reaproveita a
+    imagem `ontresearch/wf-common` que o pipeline já usa em outros pontos de relatório, em
+    vez de duplicar `pysam` numa imagem própria). Chamado de dois jeitos diferentes:
+    - `workflows/wf-human-sv.nf`: direto com o TSV cru do AnnotSV
+      (`<amostra>.wf_sv.annotsv.tsv`) → produz `<amostra>.wf_sv.annotated.vcf.gz`.
+    - `modules/local/cnv_ensemble.nf`: com o TSV já mesclado do ensemble
+      (`<amostra>.wf_cnv.annotated.tsv`, ISV_/ClassifyCNV_ inclusos) → produz
+      `<amostra>.wf_cnv.annotated.vcf.gz` (ver seção do ensemble).
+    O script (`bin/annotate_vcf_from_annotsv.py`) detecta sozinho qual dos dois formatos
+    recebeu (checa se a coluna `Chr` já existe — se sim é o TSV do ensemble, já canônico;
+    se não, normaliza o TSV cru do AnnotSV do mesmo jeito que
+    `cnv_ensemble_classify.py::load_annotsv_cnvs` já fazia: filtra `Annotation_mode ==
+    "full"`, deriva `Chr`/`Start`/`Stop`/`Type` de `SV_chrom`/`SV_start`/`SV_end`/`SV_type`,
+    prefixa o resto com `AnnotSV_`). Casamento de linha com registro VCF por
+    `(CHROM, POS, INFO/SVTYPE)`; registros sem TSV correspondente (ex. CNV em contig
+    alternativo) passam intactos, sem anotação. Substitui por completo o antigo
+    `bin/annotate_cnv_vcf.py` (que só cobria CNV) — mesma lógica, generalizada.
+- **`workflows/wf-human-sv.nf`** — dentro do bloco `if (params.annotation) { ... }` da
+  workflow `bam`, depois de `final_vcf = annotate_sv_vcf(...)`, chama
+  `annotsv(final_vcf, genome_build, "sv")` e, se `params.annotsv` for `true`, também
+  `annotate_vcf_with_tsv(annotsv_result, final_vcf, "sv")` em seguida — sem flag extra
+  (diferente do `cnv_ensemble`, não precisa de nenhuma ferramenta pesada, só reaproveita
+  `wf_common`). Os dois resultados (`annotsv_tsv` e `annotsv_vcf`, o novo
+  `.wf_sv.annotated.vcf.gz`) entram no `report.html.concat(...)` que já existia.
+- **`workflows/wf-human-cnv.nf`** — mesmo padrão pro TSV: depois de
+  `spectre_final_vcf = annotate_vcf(vcf_for_annotation, genome_build, "cnv")`, chama
+  `annotsv(spectre_final_vcf, genome_build, "cnv")` se `params.annotsv`, e o TSV
+  (`.wf_cnv.annotsv.tsv`) entra em `output = spectre_final_vcf...concat(report, annotsv_tsv,
+  ...)`, publicado via `output_cnv`. O VCF anotado do CNV **não** vem direto daqui — vem do
+  `cnv_ensemble` (ver seção própria), que usa o TSV já mesclado em vez do TSV cru do
+  AnnotSV. Só ligado no caminho Spectre (`cnv` workflow, `--sv`-equivalente pra CNV) — o
+  caminho QDNAseq (`workflows/wf-human-cnv-qdnaseq.nf`, usado com `--use_qdnaseq`) não foi
+  tocado, já que o pedido/teste original foi só com o `.wf_cnv.vcf.gz` do Spectre
+  (`##source=Spectre` no header).
+- **Segundo bug real, achado só com um teste de ponta a ponta pelo Nextflow (não pelo
+  `docker run` manual)**: faltava `procps` (pacote que fornece o binário `ps`) na
+  imagem — o Nextflow precisa rodar `ps` *dentro* do container pra coletar métricas de
+  recurso de cada task (trace/report, ligados por padrão em `base.config`), e sem isso o
+  processo falhava com `Command 'ps' required by nextflow to collect task metrics cannot
+  be found`. Como não é dependência do próprio AnnotSV (não aparece na receita bioconda),
+  só apareceu ao rodar via Nextflow de verdade, nunca num `docker run` isolado. Corrigido
+  adicionando `procps` no `apt-get install` do Dockerfile, rebuild e repush (digest atual
+  `sha256:fc0c3fe3...`). **Lição**: pra qualquer imagem nova usada pelo Nextflow, testar
+  com um workflow Nextflow real antes de considerar validado — `docker run` sozinho não
+  pega essa classe de dependência (coisas que o *orquestrador* precisa, não a ferramenta).
+- **`base.config`** — `params.wf.annotsv_tag = "3.5.10"`; label `annotsv` com
+  `container = "romualdomf/annotsv:${params.wf.annotsv_tag}"` — **hardcoded**, igual ao
+  `ensemblorg/ensembl-vep` do VEP, não um `params.*` configurável (ver "Por que o
+  namespace do Docker Hub é hardcoded" abaixo) — nos blocos padrão e `awsbatch`; bind
+  mount de `params.annotsv_annotations_dir` via `containerOptions` nos profiles
+  `standard`/`singularity`, igual ao VEP.
+- **`nextflow.config`** — novos parâmetros:
+  ```groovy
+  annotsv = false                                     // opt-in, desligado por padrão
+  annotsv_annotations_dir = "/mnt/d/annotsv/annotations"
+  annotsv_human_annotations_version = "3.5"
+  ```
+  Ao contrário do VEP, não havia dados do AnnotSV já presentes nesta máquina, então
+  `annotsv_annotations_dir` aponta pra uma pasta nova (vazia) — a primeira execução com
+  `--annotsv` vai baixar os ~5GB de anotação humana automaticamente.
+
+### Por que o namespace do Docker Hub é hardcoded (não um `params.annotsv_image`)
+Na primeira versão, o namespace era configurável via `params.annotsv_image =
+"romualdomf/annotsv"` em `nextflow.config`, com `base.config` montando o nome completo
+via closure (mesmo motivo das closures do VEP: ordem de parse). O usuário perguntou se
+publicar num Docker Hub pessoal (conta free) impunha algum limite de download pra quem
+baixa — a resposta é que o rate limit do Docker Hub é aplicado a **quem puxa a imagem**
+(100 pulls/6h anônimo, 200/6h autenticado free, ilimitado em conta paga), não à conta
+que publicou. Como isso não é um limite "por imagem" que a conta publicadora controla,
+não fazia sentido manter esse pedaço configurável separadamente — foi simplificado pra
+hardcoded, no mesmo padrão do `ensemblorg/ensembl-vep` do VEP (que também é fixo,
+direto em `base.config`, sem um `params.vep_image`).
+
+### O que falta validar
+- [x] Push da imagem — confirmado no Docker Hub (`romualdomf/annotsv:3.5.10`, ver acima).
+- [x] Teste funcional de ponta a ponta pelo Nextflow — feito, contra dados reais
+      (`/mnt/d/OMICS_09.wf_cnv.vcf.gz`, anotação humana completa já baixada em
+      `/mnt/d/annotsv/annotations/Annotations_Human`, 20GB). `download_annotsv_annotations`
+      → `run_annotsv` rodou de ponta a ponta via `include {annotsv} from
+      './modules/local/annotsv.nf'`, produziu `OMICS_09.wf_cnv.annotsv.tsv` idêntico ao
+      resultado do `docker run` manual anterior. Isso só foi testado pro `output_label
+      "cnv"`; o caminho `"sv"` (usado em `workflows/wf-human-sv.nf`) usa exatamente o
+      mesmo código genérico de `run_annotsv`, só não foi exercitado com um `.wf_sv.vcf.gz`
+      real ainda.
+      - O download da anotação humana (~5GB) em si teve dois problemas reais nesta
+        sessão, não relacionados ao código do pipeline: (1) o servidor
+        (`lbgi.fr`/`cstb-icube.fr`) cortava conexões HTTP longas depois de pouco tempo
+        (`curl: (18) transfer closed`), tornando um `curl` de conexão única
+        impraticavelmente lento/instável; resolvido baixando em paralelo por 16 faixas de
+        bytes (`curl -r start-end`, o servidor suporta `Accept-Ranges: bytes`) e
+        concatenando no final — não é algo que `download_annotsv_annotations` faz hoje
+        (ainda usa `curl -C -` de conexão única, igual ao padrão do VEP) — se isso for um
+        problema recorrente nesse servidor específico, vale portar essa lógica de
+        download paralelo pro processo real.
+- [x] `variantconvert`/`-vcf 1` — removido de vez (ver acima); `run_annotsv` só pede TSV
+      (`custom_args` vazio por padrão nas duas listas), e a imagem não suporta mais `-vcf 1`
+      de propósito — o pipeline gera seu próprio VCF anotado via `annotate_vcf_with_tsv`.
+- [x] `.wf_cnv.annotated.vcf.gz` — testado de ponta a ponta pelo Nextflow real (ver seção do
+      ensemble de CNV), `bcftools view -h`/`bcftools stats` sem erros de header.
+- [ ] `.wf_sv.annotated.vcf.gz` (novo, mesmo `annotate_vcf_with_tsv`/
+      `bin/annotate_vcf_from_annotsv.py`, mas alimentado com o TSV cru do AnnotSV em vez do
+      TSV mesclado do ensemble) — ainda não testado de ponta a ponta.
+- [ ] `nextflow_schema.json` não tem os novos parâmetros `annotsv*` (mesma situação dos
+      parâmetros do VEP).
+
+## Limitações conhecidas / próximos passos
+- [ ] Confirmar o auto-download real do **cache** (multi-GB) do zero até o fim — só
+      testado o caminho "já existe, pula" e o download real de plugins (menor).
+- [ ] `--fasta`/`--hgvs` não são passados ao VEP (roda só `--offline --cache
+      --check_existing --sift b`), então `HGVSc`/`HGVSp` ficam vazios no CSQ e na tabela
+      do relatório. Não implementado porque exigiria montar também o diretório do
+      `params.ref` no container do VEP (hoje só cache/plugins são montados) — dá para
+      adicionar depois se for necessário.
+- [ ] `nextflow_schema.json` não tem os novos parâmetros `vep_*` (funcionam normalmente
+      via CLI/config, só não aparecem bonitinhos no `--help` nem no formulário do
+      epi2meLabs GUI).
+- [ ] `SIFT`/`CLIN_SIG` na tabela do relatório vêm do *primeiro* bloco de transcrito do
+      CSQ que tiver `CLIN_SIG` preenchido — como VEP lista vários transcritos por
+      variante e `SIFT` só é calculado para consequências missense, é possível que esse
+      bloco escolhido não seja o mesmo que tem o `SIFT` mais informativo (fica em branco
+      nesse caso, mesmo que outro transcrito da mesma variante tenha um valor). Não é bug
+      (a variante realmente não tem SIFT *naquele* transcrito), mas poderia ser refinado
+      escolhendo o transcrito canônico/mais severo, se isso importar no futuro.
+- [ ] Rodar o pipeline completo com os dados demo oficiais
+      (`wget .../wf-human-variation-demo.tar.gz`, referenciado no `README.md`) para uma
+      validação de ponta a ponta antes de considerar isso pronto para uso "de verdade".
+
+## Ensemble de classificação de CNV (`bin/cnv_ensemble_classify.py`)
+
+**Integrado ao pipeline** (`params.cnv_ensemble`, opt-in, depende de `params.annotsv`
+também estar ligado — ver "Integração no pipeline" abaixo). Começou como script
+standalone a pedido do usuário, depois o usuário pediu pra integrar de verdade. Pega o
+`.wf_cnv.annotsv.tsv` do AnnotSV e roda mais duas ferramentas de anotação/classificação
+de CNV, juntando tudo numa única tabela — **`.wf_cnv.annotated.tsv`** (renomeado de
+`.wf_cnv.final.tsv` a pedido do usuário, pra deixar claro que é o TSV anotado final do
+CNV, no mesmo espírito do `.annot_vcf` do VEP):
+- [ISV](https://github.com/tsladecek/isv_package) (`isv.annotate` + `isv.predict`) — GRCh38 nativo.
+- [ClassifyCNV](https://github.com/Genotek/ClassifyCNV) — ACMG 2019, hg19 ou hg38.
+- **X-CNV não foi incluído** — a pedido do usuário, depois de eu levantar que só suporta
+  GRCh37/hg19 (nosso pipeline é GRCh38, exigiria liftover) e precisa de ~3,2GB de dados
+  de um servidor único sem HTTPS/CDN (`119.3.41.228`).
+
+### Formato da tabela final
+Primeiras 4 colunas, **sem prefixo**: `Chr`, `Start`, `Stop`, `Type` (vêm do AnnotSV,
+`SV_chrom`/`SV_start`/`SV_end`/`SV_type` das linhas `Annotation_mode == "full"` — só uma
+linha por CNV, não uma por gene sobreposto como as linhas "split"). Todas as outras
+colunas de cada ferramenta entram prefixadas (`AnnotSV_`, `ISV_`, `ClassifyCNV_`,
+inclusive a coluna que já se chama `AnnotSV_ID` no output do AnnotSV vira
+`AnnotSV_AnnotSV_ID` — redundante mas deliberado, prefixar tudo sem exceção é mais
+previsível que abrir uma exceção). Junção feita por (Chr, Start, Stop, Type), não por
+posição de linha — se uma ferramenta descartar um CNV (ex.: ClassifyCNV ignora CNVs em
+contigs alternativos), essa linha só fica com `NaN` nas colunas daquela ferramenta em vez
+de desalinhar a tabela toda.
+
+### VCF anotado (`.wf_cnv.annotated.vcf.gz`)
+A pedido do usuário, as colunas de `.wf_cnv.annotated.tsv` também são escritas de volta no
+`.wf_cnv.vcf.gz` original (o mesmo VCF que entrou no AnnotSV) como campos INFO, produzindo
+`.wf_cnv.annotated.vcf.gz`. Feito por um processo/container separado do ensemble em si —
+ver `annotate_vcf_with_tsv`/`bin/annotate_vcf_from_annotsv.py` na seção do AnnotSV acima
+(script compartilhado com o caminho SV, generalizado depois que o usuário pediu o mesmo
+recurso pra `.wf_sv.vcf.gz`). Motivo de separar em dois processos/containers: o passo do
+ensemble (ISV/ClassifyCNV) precisa da imagem pesada `romualdomf/cnv-ensemble`; escrever no
+VCF só precisa de `pysam`, que a imagem `ontresearch/wf-common` do próprio pipeline já tem
+(usada em outros pontos de relatório) — o usuário perguntou diretamente se eu tinha
+checado isso antes de adicionar `pysam` à imagem do ensemble, e a resposta era não, então
+troquei pra reaproveitar `wf_common` em vez de duplicar a dependência.
+
+### Bugs/obstáculos reais encontrados e resolvidos
+- **`isv` não instala com `pip install isv` puro em Python 3.12**: a versão mais recente
+  (0.3.17) exige Python ≥3.14; a mais recente compatível com 3.12 (0.3.16) fixa
+  `pandas<2`, que não tem wheel pré-compilada pra Python 3.12 (só existiria buildando do
+  código-fonte, o que por sua vez falha por faltar `pkg_resources`/`setuptools` no
+  ambiente isolado de build do pip). Resolvido com
+  `pip install isv --no-deps` seguido de instalar manualmente versões atuais de
+  numpy/pandas/xgboost/shap/numba/plotly/sklearn-json/scikit-learn — as pins do `isv`
+  são conservadoras demais, o código real funciona com essas versões modernas.
+- **`isv` falha ao importar mesmo depois disso**: sua dependência `sklearn_json`
+  (pacote abandonado, uma única versão publicada em 2021) faz
+  `from sklearn.ensemble import ..., _gb_losses` — um submódulo privado que não existe
+  mais em versões atuais do scikit-learn. Esse import só é usado por `sklearn_json` pra
+  desserializar um `GradientBoostingClassifier`; o modelo real do `isv` é baseado em
+  XGBoost, então esse caminho de código nunca roda de verdade — criei um módulo-fake
+  (`_patch_sklearn_gb_losses()` no script) só pra satisfazer o import e deixar o resto
+  funcionar. Sem isso, `import isv` quebra sempre.
+- **`isv.annotate()` espera `int` de verdade pras coordenadas**, não string — passei
+  string na primeira tentativa (peguei tudo como string do TSV do AnnotSV pra manter
+  fidelidade genérica) e o código JIT (`numba`) do `isv` quebrou com um erro de tipo
+  bem confuso (`le(array(int64...), unicode_type)`). Corrigido convertendo
+  `Start`/`Stop` pra `int` só na hora de montar a lista que vai pro `isv.annotate()`.
+- `ClassifyCNV` e `bedtools` (já presente no sistema) funcionaram de primeira, sem
+  surpresas, contra os dados reais de `/mnt/d/OMICS_09.wf_cnv.vcf.gz`/`.annotsv.tsv`.
+
+### Container: `docker/cnv_ensemble/Dockerfile` → `romualdomf/cnv-ensemble:1.0.0`
+ISV + ClassifyCNV **num único container** (não dois separados) — o usuário perguntou se
+dava, e sim: `ClassifyCNV` não tem nenhuma dependência Python (só stdlib + `bedtools`,
+confirmei lendo o código), nada nele conflita com o stack do `isv`, e as duas ferramentas
+sempre rodam juntas no mesmo passo lógico do ensemble, então não faz sentido puxar duas
+imagens Docker separadas. `AnnotSV` continua num container à parte (é usado
+independentemente e monta uma pasta de anotação de ~20GB que não tem nada a ver com
+essas duas). Dockerfile: Debian bookworm + `bedtools`/`git`/`python3`/`procps` (aprendi
+da vez do AnnotSV que o Nextflow precisa de `ps` dentro do container), `pip install isv
+--no-deps` + versões modernas de numpy/pandas/xgboost/etc. manualmente (mesmo motivo do
+script), e `git clone` do ClassifyCNV (tag `v1.1.1`) direto pra dentro da imagem — sem
+dado externo pra baixar em runtime, ao contrário do VEP/AnnotSV (nem cache nem pasta de
+anotação: o modelo do ISV vem embutido no próprio pacote pip, e os bancos do ClassifyCNV
+vêm no próprio repositório). **Sem `pysam`** — a escrita do VCF anotado é um processo
+separado, na imagem `ontresearch/wf-common` (ver "VCF anotado" acima); cheguei a
+adicionar `pysam` aqui numa primeira versão, mas o usuário perguntou se eu tinha checado
+se já não estava disponível em algum container existente do pipeline, e estava —
+removido e reconstruído. Publicado com sucesso no Docker Hub (~772MB comprimidos) — o
+push também sofreu do mesmo problema de rede lento já visto com o AnnotSV (uma tentativa
+de ~70min pareceu travada numa camada grande; cancelei e tentei de novo, e a nova
+tentativa descobriu que aquela camada já tinha terminado de verdade — só faltava uma
+pequena por cima, terminou rápido).
+
+### Integração no pipeline
+- **`modules/local/cnv_ensemble.nf`** — `process run_cnv_ensemble` (label `cnv_ensemble`)
+  roda `cnv_ensemble_classify.py` (chamado *sem* caminho, via `bin/` do Nextflow — por
+  isso o script mora em `bin/`, não em `scripts/` como na primeira versão) usando
+  `--classifycnv-dir "$CLASSIFYCNV_DIR"` (variável de ambiente já setada no Dockerfile,
+  aponta pro clone dentro da imagem), produzindo `.wf_cnv.annotated.tsv`. Em seguida
+  encadeia com `annotate_vcf_with_tsv` (importado de `modules/local/annotsv.nf`, mesmo
+  processo que o caminho SV usa — ver seção do AnnotSV), alimentado com esse TSV já
+  mesclado + o `.wf_cnv.vcf.gz` original, produzindo `.wf_cnv.annotated.vcf.gz`. Sem
+  `publishDir` próprio em nenhum dos dois — TSV e VCF entram no canal `output` do
+  workflow `cnv` e são publicados via `output_cnv`, na mesma pasta de saída padrão do
+  resto do pipeline (`params.out_dir`). `run_cnv_ensemble` pulado (`optional: true`) pra
+  genome builds que não são hg19/hg38. `workflow cnv_ensemble` compõe os dois passos,
+  recebendo a tupla `(xam_meta, annotsv.tsv)` que sai direto do `annotsv(...)` e a tupla
+  `(xam_meta, vcf.gz, tbi)` original (sem descartar o `xam_meta`, precisa dele pro nome
+  dos arquivos de saída), emitindo `annotated_tsv` e `annotated_vcf`.
+- **`workflows/wf-human-cnv.nf`** — dentro do `if (params.annotsv) { ... }` (depois de já
+  ter chamado `annotsv(...)`), chama `cnv_ensemble(annotsv_result, spectre_final_vcf,
+  genome_build)` só se `params.cnv_ensemble` também for `true` — ou seja, **exige os dois
+  flags ligados** (`--annotsv --cnv_ensemble`), porque o ensemble consome a saída do
+  AnnotSV diretamente, não faz sentido ligar um sem o outro. TSV e VCF finais entram em
+  `output = spectre_final_vcf...concat(report, annotsv_tsv, cnv_ensemble_tsv,
+  cnv_ensemble_vcf)`.
+- **`base.config`** — `params.wf.cnv_ensemble_tag = "1.0.0"`; label `cnv_ensemble` com
+  `container = "romualdomf/cnv-ensemble:${params.wf.cnv_ensemble_tag}"` (hardcoded, mesmo
+  motivo do AnnotSV/VEP), nos blocos padrão e `awsbatch`. **Sem** `containerOptions`/bind
+  mount — ao contrário de VEP/AnnotSV, não tem pasta de dados externa pra montar (tudo
+  já vem embutido na imagem). O processo `annotate_vcf_with_tsv` roda no label
+  `wf_common`, não `cnv_ensemble` — usa o container já existente do pipeline.
+- **`nextflow.config`** — `params.cnv_ensemble = false` (opt-in, desligado por padrão).
+
+### Testado de verdade
+1. Script isolado (venv fora do repo) contra `/mnt/d/annotsv_output/OMICS_09.wf_cnv.annotsv.tsv`
+   → `/mnt/d/OMICS_09.wf_cnv.annotated.tsv`: 5 linhas, 181 colunas (117 AnnotSV_ + 39
+   ClassifyCNV_ + 21 ISV_ + as 4 canônicas).
+2. Dentro do container recém-buildado (`docker run ... python3 bin/cnv_ensemble_classify.py ...`):
+   resultado idêntico.
+3. **Pelo Nextflow de verdade** (`include { cnv_ensemble } from './modules/local/cnv_ensemble.nf'`,
+   rodado de dentro do próprio `/mnt/d/wf-omics/` pra `bin/` resolver certo — fora do repo
+   dá erro `command not found`, já que o auto-PATH do `bin/` do Nextflow é relativo ao
+   script principal, não ao módulo incluído): resultado de novo idêntico aos dois testes
+   anteriores.
+4. **VCF anotado** (`.wf_cnv.annotated.vcf.gz`), pelo Nextflow real: validado com
+   `bcftools view -h` (sem erros de header) e `bcftools stats` (6 registros, batendo com
+   5 CNVs anotados + 1 CNV em contig alternativo que passou sem anotação, por não ter
+   linha correspondente no TSV).
+
+### Próximos passos
+- [ ] Se X-CNV for pedido no futuro, vai precisar de liftover GRCh38→GRCh37 (ex.
+      `pyliftover` + chain file da UCSC) antes de alimentar o X-CNV, e as colunas
+      Chr/Start/End que ele devolve no output devem ser descartadas (são as coordenadas
+      *lifted*, não as canônicas GRCh38) — só as colunas de anotação/score dele entrariam
+      no merge, como já é feito aqui pra ISV/ClassifyCNV.
+- [ ] `nextflow_schema.json` não tem `params.cnv_ensemble` (mesma situação de todos os
+      outros parâmetros novos desta sessão — funciona via CLI/config, só não aparece no
+      `--help` nem no formulário do epi2meLabs GUI).
+
+## DMR (Differentially Methylated Regions) — integração do ont-methylDMR-kit
+
+Adiciona duas análises de DMR opt-in, via [ont-methylDMR-kit](https://github.com/NyagaM/ont-methylDMR-kit)
+(commit `dcbc3da31db19f477194cdd33ebc3001554f888e`, clonado/analisado nesta sessão),
+usando o DSS/bsseq (R) do kit original como motor de chamada de DMR:
+- `--dmr_haplotype_compare`: haplótipo 1 vs haplótipo 2 da mesma amostra (exige `--phased`).
+- `--dmr_sample_compare` + `--dmr_sample_compare_reference <arquivo>`: amostra vs uma
+  referência externa, aceitando tanto BAM/CRAM modificado (roda-se `modkit` nele) quanto
+  bedmethyl já pronto — detecção automática por extensão do arquivo.
+
+**Status: implementado e sintaticamente validado** (`nextflow config` e
+`NXF_VER=23.10.1 nextflow run main.nf --help` compilam sem erro, mesmo padrão de teste já
+usado nas outras integrações desta sessão) — **ainda não testado de ponta a ponta com
+dados reais** (diferente de VEP/AnnotSV/cnv_ensemble, que foram). Próximo passo natural:
+rodar contra `/mnt/d/OMICS_09...` (já phased) com `--phased --mod --dmr_haplotype_compare`.
+
+### Decisão central: reaproveitar a paralelização por cromossomo que já existe
+`workflows/methyl.nf::modkit`/`modkit_phase` já rodam por cromossomo (`meta.sq`) e, no
+caminho phased, `modkit_phase` já produz bedmethyl separado por haplótipo (H1/H2) e
+combinado (Hstar) — tudo **antes** de `concat_bedmethyl` juntar num único arquivo por
+amostra. Em vez de deixar o `ont-methylDMR-kit` fazer o que ele faz sozinho (sempre juntar
+e depois *re-dividir* por cromossomo antes do DSS, mesmo partindo de bedmethyl pronto),
+esta integração intercepta *antes* do merge e reaproveita a divisão que já existe —
+`workflow mod` passou a emitir também `modkit_H1_per_chr`/`modkit_H2_per_chr`/
+`sample_bedmethyl_per_chr` (canais pré-merge, só isso mudou em `methyl.nf`; o
+comportamento de `bedmethyl`/`bigwig`/`igv` que já existia não foi tocado).
+
+### Arquivos novos
+- **`modules/local/dmr.nf`** — todos os processos: `prep_dmr_bedmethyl` (filtra
+  bedmethyl.gz por código de base `m`/`h` + formata as 4 colunas que o DSS espera —
+  já recebe o arquivo por cromossomo, não precisa dividir), `split_bedmethyl_by_chr`
+  (só quando a referência do `dmr_sample_compare` é um bedmethyl pronto, não BAM — divide
+  por cromossomo restrito a `chromosome_codes`, sem filtrar por tipo de base ainda, pra
+  rodar uma vez só e servir tanto 5mC quanto 5hmC depois), `list_reference_chromosomes`
+  (intersecta `chromosome_codes` com os `@SQ` reais do BAM de referência, via
+  `samtools view -H`, container default — não tem `bam_flagstats` pronto pra um BAM
+  externo como tem pra a amostra principal), `dmr_calling` (o R/DSS do kit original,
+  parâmetros hardcoded idênticos: delta=0.10, p=0.01, minlen=100, minCG=10,
+  dis.merge=100), `aggregate_dmrs`, `download_dmr_annotations` (mesmo padrão idempotente
+  de `download_vep_cache`/`download_annotsv_annotations` — baixa
+  `annotations.tar.gz` do `ont-methylDMR-kit` via `raw.githubusercontent.com` **pinado no
+  commit** analisado, já que o kit não tem URL de download estável, só commita o tarball
+  de 73MB no próprio repo git), `annotate_dmrs` (bedtools intersect contra gencode v46 +
+  filtro opcional de genes imprinted), `prepare_gene_list`, `report_dmrs` (HTML
+  pandas/matplotlib), e os 4 processos de plot (`plot_dmr_modbamtools`/
+  `plot_dmr_methylartist` para 2 BAMs reais — caso `dmr_sample_compare` com referência em
+  BAM —, `plot_phased_dmr_modbamtools`/`plot_phased_dmr_methylartist` para 1 BAM
+  haplotagged com `-hp`/`--phased` — caso `dmr_haplotype_compare`, já que ali só existe UM
+  BAM físico, H1/H2 são tags dentro dele).
+- **`workflows/dmr.nf`** — `workflow dmr_haplotype_compare` e `workflow dmr_sample_compare`,
+  cada uma iterando internamente sobre `["m", "h"]` (5mC e 5hmC — o modkit do wf-omics já
+  gera bedmethyl pros dois). `dmr_stage_flags(args)` faz o parsing de um subconjunto
+  literal do vocabulário de flags do CLI original do kit (`--plot`,
+  `--methylartist_only`, `--gene_list <path>`, `--imprinted`) — anotação e relatório
+  **sempre rodam** quando o modo está ativo (igual ao kit original, onde também não são
+  opcionais), só o plot é controlado por essas flags.
+
+### Parâmetros novos (`nextflow.config`)
+```groovy
+dmr_haplotype_compare = false
+dmr_sample_compare = false
+dmr_sample_compare_reference = null
+dmr_haplotype_compare_args = ["--plot"]   // default = pipeline completo, a pedido do usuário
+dmr_sample_compare_args = ["--plot"]
+dmr_annotations_dir = "/mnt/d/dmr_annotations"
+```
+Os dois `*_args` são a forma do usuário reduzir escopo por comparação (ex.: `[]` = só DMR
++ anotação + relatório, sem plots) — decisão explícita do usuário: default com o pipeline
+inteiro ligado, `*_args` só pra quem quiser cortar.
+
+### Containers (`base.config`)
+Reaproveita imagens públicas já publicadas pelo próprio `ont-methylDMR-kit` (mesmo
+princípio do `ensemblorg/ensembl-vep` — não vale a pena rebuildar o que já existe e
+funciona), todas hardcoded (mesmo motivo do VEP/AnnotSV/cnv_ensemble — rate limit do
+Docker Hub é de quem puxa, não de quem publica): `withLabel:dmr_analysis` →
+`nyagam/ont-methyldmr-kit:v1.0` (R/DSS/bsseq + bedtools — usado pra tudo que não é
+plot/report), `withLabel:dmr_report` → `nyagam/seaborn:0.13.2` (só esse tem matplotlib;
+`wf_common` do próprio wf-omics tem pandas mas não matplotlib, confirmado checando
+`bin/` — não tem nenhum uso de matplotlib em lugar nenhum do repo), `withLabel:
+dmr_plot_modbamtools`/`dmr_plot_methylartist` → `nyagam/modbamtools:v0.4.8`/
+`nyagam/methylartist:v1.5.2`. Bind mount de `dmr_annotations_dir` no label
+`dmr_analysis`, mesmo padrão de `vep_cache_dir`/`annotsv_annotations_dir`.
+
+### Cuidado ao reler este código depois
+`modules/local/dmr.nf` tem processos onde o nome do arquivo de saída depende do valor de
+`mod_char` (`m`/`h` → `5mC`/`5hmC`) — o bloco `output:` **não pode referenciar uma variável
+`def` calculada dentro do `script:`** (não é visível ali; confirmado lendo
+`modules/local/vep.nf::run_vep`, que já reconstrói a mesma expressão duas vezes em vez de
+compartilhar uma var — esse é o padrão real do Nextflow nesta versão, não só estilo). Por
+isso o `output:` desses processos usa o ternário `mod_char == 'h' ? '5hmC' : '5mC'` inline,
+direto a partir do `val(mod_char)` de `input:`, em vez de um `out_label` só calculado uma
+vez.
+
+### O que falta validar
+- [ ] Ponta a ponta real: `--phased --mod --dmr_haplotype_compare` contra dados reais
+      (`/mnt/d/OMICS_09...` ou equivalente já haplotagged).
+- [ ] `--dmr_sample_compare` nos dois formatos de referência (`.bam` e `.bedmethyl.gz`) —
+      os dois ramos de detecção de tipo (`workflows/dmr.nf::dmr_sample_compare`) nunca
+      rodaram de verdade, só passaram no parse do DSL2.
+- [ ] Confirmar que `nyagam/ont-methyldmr-kit:v1.0` de fato tem tudo que os scripts em
+      `prep_dmr_bedmethyl`/`dmr_calling`/`annotate_dmrs` esperam (R/DSS/bsseq, bedtools,
+      awk) — nunca puxada/inspecionada nesta sessão, só reaproveitada por confiança no que
+      o `ont-methylDMR-kit` original já documentava sobre ela.
+- [ ] `nextflow_schema.json` não tem os novos parâmetros `dmr_*` (mesma situação de todos
+      os outros parâmetros novos desta sessão).
+
+## TAPES (classificação ACMG das variantes de SNP anotadas pelo VEP)
+
+[TAPES](https://github.com/a-xavier/tapes) (a-xavier/tapes) atribui os critérios ACMG/AMP
+(PVS1..BP7) e uma probabilidade de patogenicidade a cada variante, lendo diretamente o CSQ
+do VCF já anotado pelo VEP — sem isso, boa parte dos critérios (PP3/BP4, PS4, PM2, ...)
+depende de colunas do dbNSFP dentro do CSQ. **Não é o TAPES original**: o upstream não
+funciona contra releases atuais do dbNSFP (colunas renomeadas/removidas desde a época em
+que o projeto foi escrito, ~dbNSFP 3.x/4.x) — corrigido num fork próprio
+([github.com/RomualdoMF/tapes](https://github.com/RomualdoMF/tapes), branch
+`fix/dbnsfp5-column-mapping`, ver commit "Fix VEP-mode dbNSFP column names/values for
+dbNSFP 5.x" pra o mapeamento coluna-por-coluna) — trabalho feito numa sessão separada, fora
+deste repo (`/mnt/d/tapes/`), publicado como imagem **`romualdomf/tapes:fixed`** no Docker
+Hub (branch `docker-support`, em cima do fix). PR pro upstream **ainda não aberto** (a
+pedido do usuário).
+
+Opt-in via `params.tapes` (`false` por padrão), exige `params.annotation` (validado no
+topo de `main.nf`, mesmo padrão dos checks do DMR) — sem VCF anotado pelo VEP não tem o que
+o TAPES ler.
+
+### Como o dbNSFP entra na jogada
+`nextflow.config`, `vep_plugin_args` (já existia como mecanismo genérico pro VEP; aqui é
+onde o dbNSFP5.3.1a é ligado, **não** em `vep_custom_args` — dbNSFP é indexado por
+chr/pos/ref/alt/transcrito, só o plugin `dbNSFP` do próprio VEP sabe alinhar isso
+corretamente a cada bloco de transcrito do CSQ; um `--custom` genérico não serve):
+```groovy
+vep_plugin_args = [
+    "dbNSFP,${vep_cache_dir}/dbNSFP5.3.1a_grch38.gz,Interpro_domain,SIFT_score,MutationTaster_pred,MutationAssessor_pred,fathmm-XF_coding_pred,PROVEAN_score,MetaSVM_pred,MetaLR_pred,M-CAP_pred,GERP++_RS,clinvar_clnsig,clinvar_review,gnomAD4.1_joint_AF,gnomAD2.1.1_exomes_controls_AF"
+]
+```
+A lista de colunas é exatamente o que `src/vep_process.py` do TAPES (fork corrigido) lê por
+nome do CSQ pra computar PS3/PP5/BS3/BP6/PP3/BP4/PS4/PM2 — as mesmas colunas mapeadas na
+sessão de correção do dbNSFP5.3.1a. `dbNSFP5.3.1a_grch38.gz` já precisa estar baixado e
+tabixado dentro de `vep_cache_dir` (confirmado presente e íntegro nesta máquina via
+checagem de md5 — ver conversa anterior); ao contrário do cache do VEP em si, não tem
+processo de auto-download pro dbNSFP aqui.
+
+**Ponto em aberto, não confirmado nesta sessão**: o plugin `dbNSFP.pm` do VEP usa
+`$vf->{chr}` (o nome de cromossomo já como o VEP core internamente resolveu, incluindo
+sinônimos `chr1`/`1` do cache — ver seção VEP acima) diretamente na query ao tabix, sem
+nenhum outro tratamento de prefixo `chr` além do caso especial `MT`. O
+`dbNSFP5.3.1a_grch38.gz` usa nomes de cromossomo *sem* prefixo (`1`, `2`, ..., confirmado
+via `tabix -l`). Isso deveria funcionar por conta da resolução de sinônimos do cache VEP já
+documentada acima (mesmo motivo que dispensou o hack `chrM`→`chrMT` do SnpEff original),
+mas **não foi testado de ponta a ponta** — se as colunas do dbNSFP vierem vazias em uma
+execução real, esse é o primeiro lugar a investigar.
+
+### Arquivos novos/alterados
+- **`modules/local/tapes.nf`** (novo):
+  - `process run_tapes` (label `tapes`) — roda por contig, sobre o mesmo canal
+    `annotations` (per-contig, pré-`concat_snp_vcfs`) que `annotate_snp_vcf` já produz —
+    mesma lógica de paralelização por contig que straglr/tldr já usam, classificação é
+    por-variante então não precisa esperar o merge. Descomprime o VCF antes (o leitor VEP
+    do TAPES usa `open()` puro, sem suporte a gzip) e roda
+    `tapes.py sort -i ... -o <base>.tapes.txt --tab --acmg --assembly hg19|hg38 --acmg_db
+    /opt/tapes/acmg_db`. Pulado (`optional: true`) pra genome builds que não são hg19/hg38
+    — mesmo guard de `run_vep`, já que o `acmg_db` embutido na imagem só tem dados desses
+    dois builds.
+  - `process merge_tapes` (label `wf_common`) — concatena as tabelas por contig num só
+    `<alias>.wf_snp.tapes.txt`, mesmo idioma awk de `merge_tldr` em `modules/local/tldr.nf`
+    (mantém só o primeiro header).
+  - `workflow tapes_classify` — compõe os dois, mesmo padrão de `alias` (dedup por
+    `meta.alias`) de `workflow tldr`.
+- **`main.nf`** — dentro do bloco `else` de `if (!params.annotation)` (SNP), logo depois de
+  montar `annotations`/`snp_vcf`: `if (params.tapes) { tapes_table =
+  tapes_classify(annotations, genome_build.first()).table }`. `tapes_table` entra no mesmo
+  canal de publish do SNP (`snp_report.concat(clair3_results).concat(snp_vcf...)
+  .concat(tapes_table).flatten() | output_snp`) — sem processo de output dedicado, reusa o
+  `output_snp` que já existe. Validação no topo do workflow: `--tapes` sem `--annotation`
+  lança exceção.
+- **`base.config`** — `params.wf.tapes_tag = "fixed"`; label `tapes` com `container =
+  "romualdomf/tapes:${params.wf.tapes_tag}"` (hardcoded, mesmo motivo de
+  annotsv/cnv_ensemble/tldr) nos blocos padrão e `awsbatch`. **Sem** `containerOptions`/bind
+  mount — o `acmg_db` (~140MB) já vem embutido na imagem, não é uma pasta de dados externa
+  como o cache do VEP.
+- **`nextflow.config`** — `params.tapes = false` (opt-in) + a entrada do dbNSFP em
+  `vep_plugin_args` (ver acima).
+
+### O que falta validar
+- [ ] Ponta a ponta real contra um `.wf_snp.<contig>.vcf.gz` de verdade — nunca rodado,
+      só `nextflow config`/`--help` (compila o grafo DSL2 sem erro de sintaxe, mesmo padrão
+      de teste já usado nas outras integrações).
+- [ ] O ponto em aberto do prefixo `chr` no plugin `dbNSFP` (ver acima) — se as colunas
+      do dbNSFP vierem vazias/`.` em todas as variantes, é sinal de que a resolução de
+      sinônimo não está acontecendo como esperado antes do plugin rodar.
+- [ ] `.wf_snp.tapes.txt` final (mesclado) — a lógica de merge (`awk` header-dedup) é
+      idêntica à do `merge_tldr`, já validada em produção ali, mas nunca exercitada
+      especificamente com saída do TAPES.
+- [ ] `nextflow_schema.json` não tem `params.tapes` (mesma situação de todos os outros
+      parâmetros novos).
+
+## STR — catálogo STRchive para straglr/Stranger
+
+Troca só do **catálogo de loci**, não do código do sub-workflow STR em si
+(`modules/local/wf-human-str.nf` não mudou — só `workflows/wf-human-str.nf`, duas linhas).
+`str_list`/`variant_catalogue_hg38` (usados por straglr e Stranger respectivamente) agora
+vêm de `params.str_repeat_bed`/`params.str_variant_catalog` em vez de caminhos fixos em
+`data/`.
+
+- **`data/STRchive-disease-loci.hg38.straglr.bed`** (novo, 90 linhas) e
+  **`data/STRchive-disease-loci.hg38.stranger.json`** (novo, 78 loci) — catálogos hg38 do
+  [STRchive](https://github.com/dashnowlab/STRchive), publicados pelo próprio projeto já
+  no formato que straglr (BED) e Stranger (JSON) esperam — não precisou converter nada.
+  Substituem o catálogo original do wf-human-variation (`data/wf_str_repeats.bed` /
+  `data/variant_catalog_hg38.json`, ~52 loci, só GeneReviews), que **continuam no repo**
+  (não apagados) mas não são mais o default.
+- **`nextflow.config`** — novos parâmetros:
+  ```groovy
+  str_repeat_bed = "${projectDir}/data/STRchive-disease-loci.hg38.straglr.bed"
+  str_variant_catalog = "${projectDir}/data/STRchive-disease-loci.hg38.stranger.json"
+  ```
+  Sobrescrever os dois pra usar um catálogo próprio.
+
+### O que falta validar
+- [ ] Nunca rodado de ponta a ponta pelo Nextflow depois da troca — `output/execution/trace.txt`
+      não tem nenhum registro de execução completa. Não há motivo técnico pra esperar
+      quebra (straglr/Stranger só recebem um caminho de arquivo diferente, mesmo schema),
+      mas ainda não foi confirmado contra dados reais.
+- [ ] `nextflow_schema.json` não tem `str_repeat_bed`/`str_variant_catalog` (mesma situação
+      de todos os outros parâmetros novos).
+
+## tldr — detecção de inserções de elementos transponíveis
+
+[tldr](https://github.com/adamewing/tldr) roda por contig sobre os mesmos BAMs
+haplotagged intermediários (pré-merge) que o `call_str` do straglr já consome
+(`workflows/wf-human-snp.nf`, emit `str_bams`) — ou seja, a fase em que o alinhamento já
+aconteceu mas os BAMs por contig ainda não foram remesclados num BAM genoma-inteiro só.
+Opt-in via `params.tldr` (`false` por padrão); ligar sozinho já dispara haplotagging
+(`run_haplotagging = params.str || params.phased || params.tldr` em `main.nf`), não
+precisa de `--phased` junto.
+
+### Container: `docker/tldr/Dockerfile` → `romualdomf/tldr:1.2.2`
+Debian bookworm-slim + `samtools`/`minimap2`/`mafft`/`exonerate`/`tabix` (todas
+dependências reais do algoritmo do próprio tldr, não só do alinhamento upstream — checado
+lendo o código-fonte do tldr diretamente, não só o `tldr.yml` do conda, ver comentário no
+Dockerfile) + `procps` (mesma lição do AnnotSV/cnv_ensemble: Nextflow precisa de `ps`
+dentro do container). `pip install` direto do clone `git` na tag `1.2.2` — os pins do
+`setup.py` do tldr são só limites inferiores soltos, sem teto, então não teve o mesmo
+problema de dependências conflitantes do `isv` (ver seção do cnv_ensemble). Referência
+humana de TE (`teref.ont.human.fa`) e sítios não-referência (`nonref.collection.hg38.chr.bed.gz`)
+já vêm embutidos na própria imagem (`/opt/tldr/ref`, poucos MB) — sem download em runtime,
+ao contrário do cache do VEP/anotação do AnnotSV. Build confirmado e imagem publicada
+(`docker manifest inspect romualdomf/tldr:1.2.2` resolve no Docker Hub).
+
+### Integração no pipeline
+- **`modules/local/tldr.nf`** (novo):
+  - `process call_tldr` (label `tldr`) — roda `tldr -b <bam por contig> -e <teref> -r <ref>
+    ... -o <alias>.<contig>` só se o contig tiver reads (`samtools view -c` > 0; senão
+    `optional: true` no output e pula). Um parâmetro `tldr_*` em `nextflow.config` por
+    flag do CLI original do tldr, **exceto** `-b/-r/-o/-c` (não expostos — vêm
+    "de graça" do canal do pipeline: BAM/ref já vêm de dentro, `outbase` é determinístico
+    pra `merge_tldr` conseguir concatenar depois, e `-c/--chroms` seria redundante porque
+    o BAM por contig já só tem reads daquele contig).
+  - `process merge_tldr` (label `wf_common`) — concatena as tabelas por contig num só
+    `<alias>.wf_tldr.table.txt`, mantendo só o primeiro header (`awk 'FNR==1 && NR!=1
+    {next}'`).
+  - `process getVersions` / `process output_tldr` — mesmo padrão dos outros módulos
+    (publish via canal `output`, versões via `tldr -v`/`samtools --version`/etc.).
+  - `workflow tldr` — compõe os três, emite `output` (tabela final + versões, pro canal de
+    publish) e `table`.
+- **`main.nf`** — `if (params.tldr) { results_tldr = tldr(clair_vcf.str_bams, ref_channel);
+  output_tldr(results_tldr.output) }`, logo depois do bloco do STR. `run_haplotagging`
+  passou a incluir `params.tldr` (ver acima).
+- **`base.config`** — `params.wf.tldr_tag = "1.2.2"`; label `tldr` com
+  `container = "romualdomf/tldr:${params.wf.tldr_tag}"` — hardcoded, mesmo motivo do
+  AnnotSV/cnv_ensemble/VEP — nos blocos padrão e `awsbatch`. Sem `containerOptions`/bind
+  mount — igual ao cnv_ensemble, os dados de referência já vêm embutidos na imagem.
+- **`nextflow.config`** — `params.tldr = false` + ~25 parâmetros `tldr_*` (um por flag do
+  CLI do tldr não coberta acima: `tldr_elts`, `tldr_nonref`, `tldr_procs`,
+  `tldr_minreads`, `tldr_embed_minreads`, `tldr_max_te_len`, `tldr_min_te_len`,
+  `tldr_min_alt_frac`, `tldr_min_alt_depth`, `tldr_min_total_depth_frac`,
+  `tldr_max_cluster_size`, `tldr_wiggle`, `tldr_flanksize`, `tldr_color_consensus`,
+  `tldr_detail_output`, `tldr_extend_consensus`, `tldr_trdcol`, `tldr_keep_pickles`,
+  `tldr_use_pickles`). `tldr_elts`/`tldr_nonref` apontam pros arquivos já embutidos na
+  imagem (`/opt/tldr/ref/...`) — são strings cruas, não `path` do Nextflow, porque os
+  defaults vivem dentro da imagem, não no host (um `path` faria o Nextflow tentar — e
+  falhar — fazer stage deles a partir do host antes do container subir).
+
+### O que falta validar
+- [ ] Nunca rodado de ponta a ponta pelo Nextflow — só o build/push da imagem foi
+      confirmado (`docker manifest inspect`), o parse DSL2 (`nextflow config`/`--help`)
+      não foi reconfirmado especificamente depois desta integração, e não há nenhum
+      registro de execução em `output/execution/trace.txt`.
+- [ ] `nextflow_schema.json` não tem `params.tldr`/`tldr_*` (mesma situação de todos os
+      outros parâmetros novos).

@@ -267,7 +267,7 @@ workflow snp {
 workflow report_snp {
     take:
         vcf_stats
-        clinvar_vcf
+        annotated_vcf
         workflow_params
 
     main:
@@ -277,7 +277,7 @@ workflow report_snp {
 
         // Create report
         makeReport(
-            vcf_stats, software_versions.collect(), workflow_params, clinvar_vcf)
+            vcf_stats, software_versions.collect(), workflow_params, annotated_vcf)
 
     emit:
         report = makeReport.out.report

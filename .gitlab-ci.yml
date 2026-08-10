@@ -14,17 +14,14 @@ variables:
     NF_WORKFLOW_OPTS: "--snp --sv --bam ${CI_PROJECT_NAME}/data/snp_demo/chr6_chr20.bam --bed ${CI_PROJECT_NAME}/data/snp_demo/chr6_chr20.bed --ref ${CI_PROJECT_NAME}/data/snp_demo/chr6_chr20.fasta --clair3_model_path ${CI_PROJECT_NAME}/data/snp_demo/ont_r104_e81_sup_g5015 --phased --override_basecaller_cfg dna_r10.4.1_e8.2_400bps_hac_prom"
     CI_FLAVOUR: "new"
     PYTEST_CONTAINER_CONFIG_KEY: "e2l_base_tag"
+    WF_TEMPLATE_ENFORCEMENT_REF: "v5.7.1"
 
 check-models:
     extends: .preflight
     script:
-        - !reference [.install, nextflow] # requires nextflow to read config
-        - bash util/update_models_schema.sh . docker
-        - >
-            if ! diff nextflow_schema.json nextflow_schema.json.new; then
-                echo "Model schema requires updating."
-                exit 1
-            fi
+        - !reference [.install, scripts] # requires get_artifactory
+        - bash util/update_models_schema.sh .
+
 
 docker-run:
     artifacts:

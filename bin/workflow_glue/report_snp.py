@@ -8,21 +8,37 @@ import sys
 from bokeh.models import HoverTool
 from dominate.tags import a, h6, p
 from ezcharts.components.bcfstats import load_bcfstats
-from ezcharts.components.clinvar import load_clinvar_vcf
 from ezcharts.components.ezchart import EZChart
 from ezcharts.components.reports.labs import LabsReport
 from ezcharts.components.theme import LAB_head_resources
 from ezcharts.layout.snippets import DataTable, Stats, Tabs
+from ezcharts.layout.util import isolate_context
 from ezcharts.plots import util
 from ezcharts.plots.categorical import barplot
 from ezcharts.plots.matrix import heatmap
 import numpy as np
 import pandas as pd
+from pysam import VariantFile
 
 from .util import get_named_logger, wf_parser  # noqa: ABS101
 
 # Global variables
 Colors = util.Colors
+
+# link out for genes, using the Ensembl gene ID VEP puts in CSQ (we're
+# VEP/Ensembl-based now, unlike the old ClinVar/NCBI-gene-id based link)
+ENSEMBL_GENE_BASE = "https://www.ensembl.org/Homo_sapiens/Gene/Summary?g="
+
+# desired order of clinical significances (most clinically relevant first),
+# using the same vocabulary as VEP/Ensembl's CLIN_SIG field
+CLIN_SIG_ORDER = [
+    "Pathogenic", "Pathogenic, low penetrance",
+    "Likely pathogenic", "Likely pathogenic, low penetrance",
+    "Uncertain significance", "Conflicting interpretations of pathogenicity",
+    "Risk factor", "Established risk allele", "Likely risk allele",
+    "Uncertain risk allele", "Association", "Confers sensitivity", "Affects",
+    "Protective", "Association not found", "Drug response", "Other",
+    "Not provided", "Benign"]
 
 # Mutation profile palette to match the COSMIC
 # patterns.
@@ -80,6 +96,95 @@ def parse_changes(bcftools_dt):
         columns="Reference allele",
         values="count")
     return df2
+
+
+def parse_vep_csq_format(vcf_header):
+    """Get the ordered list of CSQ subfield names from a VEP-annotated VCF header."""
+    description = vcf_header.info['CSQ'].description
+    # Description reads e.g. "Consequence annotations from Ensembl VEP. Format:
+    # Allele|Consequence|...|SIFT|CLIN_SIG|SOMATIC|PHENO"
+    return description.split('Format: ')[-1].split('|')
+
+
+def load_clin_sig_variants(vcf_fn, sample_name, benign=False):
+    """Extract clinically significant variants from a VEP-annotated VCF.
+
+    Significance comes from VEP's own standard CLIN_SIG annotation (added via
+    --check_existing, see modules/local/vep.nf run_vep), sourced from known
+    variants in the VEP cache itself -- no separate ClinVar VCF is used. SIFT
+    deleteriousness predictions (--sift) are read the same way. Both live
+    inside the CSQ INFO field, repeated identically for every transcript
+    consequence of a variant.
+    """
+    columns = [
+        'Sample', 'Chrom', 'Pos', 'Gene(s)', 'Significance', 'SIFT',
+        'Consequence', 'HGVSc', 'HGVSp', 'Existing variation',
+    ]
+    try:
+        vcf_file = VariantFile(vcf_fn)
+    except ValueError:
+        return pd.DataFrame(columns=columns)
+
+    if 'CSQ' not in vcf_file.header.info:
+        # not VEP-annotated (--skip_annotation, or an unsupported genome build)
+        return pd.DataFrame(columns=columns)
+    csq_fields = parse_vep_csq_format(vcf_file.header)
+
+    data = []
+    for variant in vcf_file.fetch():
+        if not variant.alts or 'CSQ' not in variant.info:
+            continue
+
+        # CLIN_SIG is identical across every transcript block for a given
+        # variant; use the first block that actually has one.
+        annot = None
+        for entry in variant.info['CSQ']:
+            values = dict(zip(csq_fields, entry.split('|')))
+            if values.get('CLIN_SIG'):
+                annot = values
+                break
+        if annot is None:
+            continue
+
+        significance = annot['CLIN_SIG'].replace(
+            '&', ', ').replace('_', ' ').capitalize()
+        if 'benign' in significance.lower() and not benign:
+            continue
+
+        sift = annot.get('SIFT', '') or '-'
+        consequence = annot.get('Consequence', '').replace('_', ' ')
+        existing_variation = annot.get('Existing_variation', '').replace('&', ', ')
+
+        gene_symbol = annot.get('SYMBOL', '')
+        gene_id = annot.get('Gene', '')
+        if gene_symbol and gene_id:
+            with isolate_context():
+                gene_link = str(
+                    a(gene_symbol, href=f'{ENSEMBL_GENE_BASE}{gene_id}'))
+        else:
+            gene_link = gene_symbol or 'No affected genes found'
+
+        data.append((
+            sample_name, variant.chrom, variant.pos, gene_link,
+            significance, sift, consequence,
+            annot.get('HGVSc', '') or '-', annot.get('HGVSp', '') or '-',
+            existing_variation or '-',
+        ))
+
+    df = pd.DataFrame(data, columns=columns)
+    if df.empty:
+        return df
+
+    # order rows by clinical significance (most relevant first), then position
+    sample_significances = df['Significance'].unique()
+    reordered = [
+        y for x in CLIN_SIG_ORDER
+        for y in sample_significances if y.startswith(x)]
+    reordered_unique = sorted(set(reordered), key=reordered.index)
+    df['Significance'] = pd.Categorical(
+        df['Significance'], categories=reordered_unique)
+    df.sort_values(by=['Significance', 'Chrom', 'Pos'], inplace=True)
+    return df
 
 
 def main(args):
@@ -164,38 +269,43 @@ def main(args):
                     bcfstats['TSTV'].drop(columns='id'),
                     use_index=False)
 
-    # ClinVar variants
+    # Clinically significant variants
     if not args.skip_annotation:
-        if args.clinvar_vcf is not None:
-            if os.path.exists(args.clinvar_vcf):
-                with report.add_section('ClinVar variant annotations', 'ClinVar'):
+        if args.annotated_vcf is not None:
+            if os.path.exists(args.annotated_vcf):
+                with report.add_section(
+                        'Clinically significant variants', 'Clinical significance'):
                     p(
                         "The ",
-                        a("SnpEff", href="https://pcingola.github.io/SnpEff/"),
-                        " annotation tool has been used to annotate with",
-                        a("ClinVar", href="https://www.ncbi.nlm.nih.gov/clinvar/"), '.'
-                        " Variants with ClinVar annotations will appear in the ",
-                        "table below, ranked according to their significance. ",
-                        "'Pathogenic', 'Likely pathogenic', and 'Unknown ",
-                        "significance' will be displayed first, in that order. ",
-                        "Please note that variants classified as 'Benign' or ",
-                        "'Likely benign' are not reported in this table, but ",
-                        "will appear in the VCF output by the workflow. For further",
-                        " details on the terms in the 'Significance' column, please",
-                        " visit ",
+                        a("Ensembl VEP", href="https://www.ensembl.org/vep"),
+                        " annotation tool has been used to flag known clinically",
+                        " significant variants (CLIN_SIG, aggregated by Ensembl",
+                        " from ",
+                        a("ClinVar", href="https://www.ncbi.nlm.nih.gov/clinvar/"),
+                        " and other sources) and to predict deleteriousness with",
+                        " SIFT. Flagged variants appear in the table below, ranked",
+                        " according to their significance. 'Pathogenic', 'Likely",
+                        " pathogenic', and 'Uncertain significance' will be",
+                        " displayed first, in that order. Please note that",
+                        " variants classified as 'Benign' or 'Likely benign' are",
+                        " not reported in this table, but will appear in the VCF",
+                        " output by the workflow. For further details on the",
+                        " terms in the 'Significance' column, please visit ",
                         a("this page", href=clinvar_docs_url),
                         '.')
-                    # check if there are any ClinVar sites to report
-                    clinvar_for_report = load_clinvar_vcf(args.clinvar_vcf)
-                    if clinvar_for_report.empty:
-                        h6('No ClinVar sites to report.')
+                    # check if there are any clinically significant sites to report
+                    clin_sig_for_report = load_clin_sig_variants(
+                        args.annotated_vcf, args.sample_name)
+                    if clin_sig_for_report.empty:
+                        h6('No clinically significant sites to report.')
                     else:
                         DataTable.from_pandas(
-                            clinvar_for_report, export=True, use_index=False)
+                            clin_sig_for_report, export=True, use_index=False)
 
     else:
         # Annotations were skipped
-        with report.add_section('ClinVar variant annotations', 'ClinVar'):
+        with report.add_section(
+                'Clinically significant variants', 'Clinical significance'):
             p(
                 "This report was generated without annotations. To see"
                 " them, re-run the workflow without --skip_annotation.")
@@ -252,8 +362,9 @@ def argparser():
         help="Final VCF stats file"
     )
     parser.add_argument(
-        "--clinvar_vcf", required=True,
-        help="VCF file of variants annotated in ClinVar"
+        "--annotated_vcf", required=True,
+        help="Full VEP-annotated VCF file (ClinVar rows are extracted from its "
+             "CSQ field)"
     )
     parser.add_argument(
         "--sample_name", default='Sample',

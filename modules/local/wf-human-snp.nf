@@ -725,13 +725,13 @@ process makeReport {
         tuple val(xam_meta), path(vcfstats)
         path versions
         path "params.json"
-        path clinvar_vcf
+        path annotated_vcf
     output:
         path "${xam_meta.alias}.wf-human-snp-report.html", emit: 'report', optional: true
         path "${xam_meta.alias}.snvs.json", emit: 'json'
     script:
         String workflow_name = workflow.manifest.name.replace("epi2me-labs/", "")
-        def clinvar = clinvar_vcf ?: ""
+        def annotated = annotated_vcf ?: ""
         def annotation = params.annotation ? "" : "--skip_annotation"
         def generate_html = params.output_report ? "" : "--skip_report"
 
@@ -748,7 +748,7 @@ process makeReport {
         --params params.json \
         --vcf_stats $vcfstats \
         --sample_name $xam_meta.alias \
-        --clinvar_vcf $clinvar \
+        --annotated_vcf $annotated \
         --workflow_version ${workflow.manifest.version} \
         $annotation $generate_html
         """
