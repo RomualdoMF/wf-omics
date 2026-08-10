@@ -82,6 +82,20 @@ process merge_tldr {
 process getVersions {
     label "tldr"
     cpus 1
+    // This process finishes in well under a second, which races Nextflow's own
+    // background resource-trace collector (nxf_mem_watch, polling /proc/$pid inside
+    // the container) against the task's FD teardown -- observed failing with
+    // inconsistent exit codes (1, 141/SIGPIPE) despite versions.txt always coming out
+    // correct, reproducible even standalone outside the pipeline. Not something
+    // fixable from here (it's in Nextflow's own generated wrapper, not this script) --
+    // the `sleep 1` gives the watcher time to poll at least once before the process
+    // exits, and retry is a safety net for whatever timing slips through anyway.
+    // Purely diagnostic (feeds the software-versions report, nothing downstream
+    // depends on it) -- if it's still hitting the race after a couple retries,
+    // give up gracefully rather than failing an entire multi-hour run over a
+    // missing version string.
+    errorStrategy { task.attempt <= 2 ? 'retry' : 'ignore' }
+    maxRetries 2
     output:
         path "versions.txt"
     script:
@@ -91,6 +105,7 @@ process getVersions {
         minimap2 --version | sed 's/^/minimap2,/' >> versions.txt
         mafft --version 2>&1 | head -n 1 | sed 's/^/mafft,/' >> versions.txt
         exonerate --version | head -n 1 | sed 's/exonerate from exonerate version/exonerate,/' >> versions.txt
+        sleep 1
         """
 }
 
