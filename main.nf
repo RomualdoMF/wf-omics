@@ -11,6 +11,9 @@ include { output_sv } from './modules/local/wf-human-sv'
 include { str } from './workflows/wf-human-str'
 include { output_str } from './modules/local/wf-human-str'
 
+include { tldr } from './modules/local/tldr'
+include { output_tldr } from './modules/local/tldr'
+
 include { cnv as cnv_spectre } from './workflows/wf-human-cnv'
 
 include { cnv as cnv_qdnaseq } from './workflows/wf-human-cnv-qdnaseq'
@@ -28,13 +31,11 @@ include {
     failedQCReport; 
     makeAlignmentReport; 
     getVersions;
-    getGenome; 
+    getGenome;
     eval_downsampling;
     downsampling;
-    annotate_vcf as annotate_snp_vcf;
     concat_vcfs as concat_snp_vcfs;
     concat_vcfs as concat_refined_snp;
-    sift_clinvar_vcf as sift_clinvar_snp_vcf;
     bed_filter;
     sanitise_bed;
     sanitise_bed as sanitise_coverage_bed;
@@ -43,6 +44,14 @@ include {
     infer_sex;
     haplocheck;
 } from './modules/local/common'
+
+include {
+    annotate_vcf as annotate_snp_vcf;
+} from './modules/local/vep'
+
+include {
+    tapes_classify;
+} from './modules/local/tapes'
 
 include {
     getParams;
@@ -71,11 +80,16 @@ include {
     output_snp;
 } from "./modules/local/wf-human-snp.nf"
 
-include { 
+include {
     mod;
     validate_modbam;
     sample_probs;
 } from './workflows/methyl'
+
+include {
+    dmr_haplotype_compare;
+    dmr_sample_compare;
+} from './workflows/dmr'
 
 
 
@@ -153,8 +167,37 @@ workflow {
     }
 
     // Trigger haplotagging
-    def run_haplotagging = params.str || params.phased
-    
+    def run_haplotagging = params.str || params.phased || params.tldr
+
+    // DMR calling validation (see workflows/dmr.nf)
+    if (params.dmr_haplotype_compare && !params.mod) {
+        throw new Exception(colors.red + "--dmr_haplotype_compare requires --mod (needs the modkit bedmethyl)." + colors.reset)
+    }
+    if (params.dmr_haplotype_compare && !run_haplotagging) {
+        throw new Exception(colors.red + "--dmr_haplotype_compare requires --phased (haplotype 1 vs haplotype 2 needs haplotagged bedmethyl)." + colors.reset)
+    }
+    if (params.dmr_sample_compare && !params.mod) {
+        throw new Exception(colors.red + "--dmr_sample_compare requires --mod (needs the modkit bedmethyl)." + colors.reset)
+    }
+    if (params.dmr_sample_compare && !params.dmr_sample_compare_reference) {
+        throw new Exception(colors.red + "--dmr_sample_compare requires --dmr_sample_compare_reference (a BAM/CRAM or bedmethyl to compare against)." + colors.reset)
+    }
+    if (params.dmr_sample_compare_reference) {
+        def dmr_ref_lower = params.dmr_sample_compare_reference.toLowerCase()
+        def dmr_ref_is_bam = dmr_ref_lower.endsWith('.bam') || dmr_ref_lower.endsWith('.cram')
+        def dmr_ref_is_bed = dmr_ref_lower.endsWith('.bed') || dmr_ref_lower.endsWith('.bedmethyl') ||
+            dmr_ref_lower.endsWith('.bed.gz') || dmr_ref_lower.endsWith('.bedmethyl.gz')
+        if (!dmr_ref_is_bam && !dmr_ref_is_bed) {
+            throw new Exception(colors.red + "--dmr_sample_compare_reference must be a .bam/.cram or a .bed/.bedmethyl(.gz), got: ${params.dmr_sample_compare_reference}" + colors.reset)
+        }
+    }
+
+    // TAPES ACMG classification (see modules/local/tapes.nf) consumes the VEP-annotated
+    // SNP VCF directly, so it can't run without annotation.
+    if (params.tapes && !params.annotation) {
+        throw new Exception(colors.red + "--tapes requires --annotation (TAPES classifies the VEP-annotated SNP VCF)." + colors.reset)
+    }
+
     // Combine data for partners
     def run_partners = params.partner?: false
     // Trigger CRAM to BAM conversion (for qdnaseq)
@@ -799,26 +842,37 @@ workflow {
         // Run annotation, when requested.
         if (!params.annotation) {
             snp_vcf = final_snp_vcf_filtered
-            // no ClinVar VCF, pass empty VCF to makeReport
-            clinvar_vcf = Channel.fromPath("${projectDir}/data/empty_clinvar.vcf")
+            // no annotated VCF, pass empty VCF to makeReport
+            annotated_vcf = Channel.fromPath("${projectDir}/data/empty_clinvar.vcf")
+            // no annotation means no TAPES either (validated at the top of the workflow)
+            tapes_table = Channel.empty()
         }
         else {
-            // do annotation and get a list of ClinVar variants for the report
+            // do annotation (functional consequences + ClinVar, both via VEP)
             // snpeff is slow so we'll just pass the whole VCF but annotate per contig
             annotations = annotate_snp_vcf(
                 final_snp_vcf_filtered.combine(clair_vcf.contigs), genome_build.first(), "snp"
             )
             snp_vcf = concat_snp_vcfs(annotations.map{ meta, vcf, tbi -> [meta,vcf]}.groupTuple(), "wf_snp").final_vcf
-            
-            sift_clinvar_snp_vcf(snp_vcf, genome_build, "snp")
-            clinvar_vcf = sift_clinvar_snp_vcf.out.final_vcf_clinvar.map{ vcf, tbi -> vcf }
+
+            // the report extracts ClinVar rows itself from the VEP CSQ field
+            // of the full annotated VCF (see report_snp.py, load_vep_clinvar_vcf)
+            annotated_vcf = snp_vcf.map{ meta, vcf, tbi -> vcf }
+
+            // TAPES ACMG classification (see modules/local/tapes.nf), run per-contig on
+            // the same pre-concat `annotations` channel above, then merged into one table.
+            if (params.tapes) {
+                tapes_table = tapes_classify(annotations, genome_build.first()).table
+            } else {
+                tapes_table = Channel.empty()
+            }
         }
 
         // Run vcf statistics on the final VCF file
         vcf_stats = vcfStats(snp_vcf)
 
         // Prepare the report
-        snp_reporting = report_snp(vcf_stats, clinvar_vcf, workflow_params)
+        snp_reporting = report_snp(vcf_stats, annotated_vcf, workflow_params)
         json_snp = snp_reporting.snp_stats_json
         if (params.output_report){
             snp_report = snp_reporting.report
@@ -830,6 +884,7 @@ workflow {
         snp_report
             .concat(clair3_results)
             .concat(snp_vcf.map{meta, vcf, tbi -> [vcf, tbi]})
+            .concat(tapes_table)
             .flatten() | output_snp
     } else {
         json_snp = Channel.empty()
@@ -882,6 +937,47 @@ workflow {
         mod_igv = Channel.empty()
     }
 
+    // DMR calling (haplotype 1 vs haplotype 2, or the sample vs an external
+    // reference) -- see workflows/dmr.nf. Both require --mod (validated above),
+    // so `results` (from the mod() call above) is guaranteed to be assigned
+    // whenever either of these runs.
+    if (params.dmr_haplotype_compare) {
+        phased_bam_for_dmr = clair_vcf.haplotagged_xam
+            | map { xam, xai, meta -> tuple(meta.alias, xam, xai) }
+        dmr_hap = dmr_haplotype_compare(
+            results.modkit_H1_per_chr,
+            results.modkit_H2_per_chr,
+            phased_bam_for_dmr,
+            ref_channel,
+            params.dmr_haplotype_compare_args
+        )
+        dmr_hap_out = dmr_hap.dmr_table.map { alias, label, mod_char, f -> f }
+            .mix(dmr_hap.annotated.map { alias, label, mod_char, f -> f })
+            .mix(dmr_hap.report)
+            .mix(dmr_hap.plots)
+    } else {
+        dmr_hap_out = Channel.empty()
+    }
+
+    if (params.dmr_sample_compare) {
+        sample_bam_for_dmr = (run_haplotagging ? clair_vcf.haplotagged_xam : pass_bam_channel)
+            | map { xam, xai, meta -> tuple(meta.alias, xam, xai) }
+        dmr_samp = dmr_sample_compare(
+            results.sample_bedmethyl_per_chr,
+            params.dmr_sample_compare_reference,
+            chromosome_codes,
+            ref_channel,
+            sample_bam_for_dmr,
+            params.dmr_sample_compare_args
+        )
+        dmr_samp_out = dmr_samp.dmr_table.map { alias, label, mod_char, f -> f }
+            .mix(dmr_samp.annotated.map { alias, label, mod_char, f -> f })
+            .mix(dmr_samp.report)
+            .mix(dmr_samp.plots)
+    } else {
+        dmr_samp_out = Channel.empty()
+    }
+
     // wf-human-cnv
     if (params.cnv) {
         // cnv calling with qdnaseq
@@ -925,6 +1021,16 @@ workflow {
         output_str(results_str.output)
     } else {
         str_vcf = Channel.empty()
+    }
+
+    // tldr (transposable element insertion detection) -- runs on the same
+    // per-contig, pre-merge haplotagged BAMs as str() above.
+    if (params.tldr) {
+        results_tldr = tldr(
+          clair_vcf.str_bams,
+          ref_channel
+        )
+        output_tldr(results_tldr.output)
     }
 
     // Combine into a final JSON of analyses stats
@@ -1024,6 +1130,8 @@ workflow {
             mosdepth_summary.flatten(),
             mosdepth_perbase.flatten(),
             mod_bedmethyl.flatten(),
+            dmr_hap_out.flatten(),
+            dmr_samp_out.flatten(),
             report_pass.flatten(),
             report_fail.flatten(),
             final_json.flatten(),

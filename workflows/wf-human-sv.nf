@@ -11,9 +11,15 @@ include {
     truvari;
 } from "../modules/local/wf-human-sv-eval.nf"
 include {
-    annotate_vcf as annotate_sv_vcf;
     haploblocks as haploblocks_sv
 } from '../modules/local/common.nf'
+include {
+    annotate_vcf as annotate_sv_vcf
+} from '../modules/local/vep.nf'
+include {
+    annotsv;
+    annotate_vcf_with_tsv
+} from '../modules/local/annotsv.nf'
 
 workflow bam {
     take:
@@ -38,6 +44,8 @@ workflow bam {
 
         if (!params.annotation) {
             final_vcf = called.vcf.join(called.vcf_index)
+            annotsv_tsv = Channel.empty()
+            annotsv_vcf = Channel.empty()
 
             report = runReport(
                 called.vcf.groupTuple(),
@@ -48,8 +56,22 @@ workflow bam {
         else {
             // append '*' to indicate that annotation should be performed on all chr at once
             vcf_for_annotation = called.vcf.join(called.vcf_index).map{ it << '*' }
-            // annotate with SnpEff
+            // annotate with VEP
             final_vcf = annotate_sv_vcf(vcf_for_annotation, genome_build, "sv").annot_vcf
+
+            // optionally rank/annotate the SVs further with AnnotSV, and (on
+            // top of that) write AnnotSV's own columns back into the VCF as
+            // INFO fields, producing .wf_sv.annotated.vcf.gz
+            if (params.annotsv) {
+                annotsv_result = annotsv(final_vcf, genome_build, "sv").annotsv_tsv
+                annotsv_tsv = annotsv_result.map{ meta, tsv -> tsv }
+                annotsv_vcf = annotate_vcf_with_tsv(annotsv_result, final_vcf, "sv").annotated_vcf
+                    .map{ meta, vcf, tbi -> [vcf, tbi] }
+            } else {
+                annotsv_tsv = Channel.empty()
+                annotsv_vcf = Channel.empty()
+            }
+
             report = runReport(
                 final_vcf.map{meta, vcf, tbi -> [meta, vcf]}.groupTuple(),
                 maybe_benchmark_result.ifEmpty(optional_file),
@@ -61,7 +83,9 @@ workflow bam {
         sv_stats_json = report.json
         report = report.html.concat(
             final_vcf.map{meta, vcf, tbi -> [vcf, tbi]},
-            maybe_benchmark_result
+            maybe_benchmark_result,
+            annotsv_tsv,
+            annotsv_vcf
         )
     
     emit:

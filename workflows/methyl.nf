@@ -225,9 +225,21 @@ workflow mod {
         // CW-2370: modkit doesn't require to treat each haplotype separately, as
         // you simply provide --partition-tag HP and it will automatically generate
         // three distinct output files, one for each haplotype and one for the untagged regions.
+        // Pre-merge, per-chromosome channels (i.e. before concat_bedmethyl collapses
+        // per-chromosome parallelism into one file per sample/group). Exposed so that
+        // downstream DMR calling (dmr_haplotype_compare / dmr_sample_compare, see
+        // workflows/dmr.nf) can join on chromosome directly, instead of merging here
+        // and re-splitting by chromosome again over there.
+        modkit_H1_per_chr = Channel.empty()
+        modkit_H2_per_chr = Channel.empty()
         if (params.phased){
             // Process the chunked haplotagged BAM file.
             modkit_out = modkit_phase(modkit_bam, reference.collect(), modkit_options)
+            modkit_H1_per_chr = modkit_out.modkit_H1
+            modkit_H2_per_chr = modkit_out.modkit_H2
+            // "Combined" per-chromosome bedmethyl (all reads, haplotype-agnostic) --
+            // used as the sample side of dmr_sample_compare when phased.
+            sample_bedmethyl_per_chr = modkit_out.modkit_Hstar
             // Concatenate the haplotypes.
             bedmethyl = modkit_out.modkit_Hstar
                 | mix(modkit_out.modkit_H1, modkit_out.modkit_H2)
@@ -236,7 +248,9 @@ workflow mod {
                 | concat_bedmethyl
         } else {
             // Run modkit.
-            bedmethyl = modkit(modkit_bam, reference.collect(), modkit_options)
+            modkit_raw = modkit(modkit_bam, reference.collect(), modkit_options)
+            sample_bedmethyl_per_chr = modkit_raw
+            bedmethyl = modkit_raw
                 | map{ meta, group, bedmethyl -> [["alias": meta.alias], group, bedmethyl]}
                 | groupTuple(by: [0,1])
                 | concat_bedmethyl
@@ -263,4 +277,12 @@ workflow mod {
         bedmethyl = bedmethyl | map { _meta, _group, bedmethyl -> bedmethyl } | collect
         bigwig = bigwig | map { _meta, _group, _mod, bigwig -> bigwig } | collect
         igv = igv
+        // Pre-merge, per-chromosome channels for DMR calling (see workflows/dmr.nf).
+        // modkit_H1_per_chr / modkit_H2_per_chr: only populated when params.phased.
+        // sample_bedmethyl_per_chr: combined/haplotype-agnostic per-chromosome bedmethyl
+        // (modkit_Hstar when phased, raw modkit output otherwise) -- the "sample" side
+        // used by dmr_sample_compare regardless of phasing.
+        modkit_H1_per_chr = modkit_H1_per_chr
+        modkit_H2_per_chr = modkit_H2_per_chr
+        sample_bedmethyl_per_chr = sample_bedmethyl_per_chr
 }

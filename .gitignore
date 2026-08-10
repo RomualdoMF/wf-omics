@@ -6,3 +6,6 @@ template-workflow
 *.pyc
 *.pyo
 .DS_store
+work/
+output/
+__pycache__/
