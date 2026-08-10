@@ -55,7 +55,11 @@ process download_dmr_annotations {
     // ensures params.dmr_annotations_dir/annotations exists, downloading it from a
     // pinned ont-methylDMR-kit commit if missing. Only invoked when annotate/report
     // is actually requested (see dmr_stage_flags in workflows/dmr.nf).
-    label "dmr_analysis"
+    // wf_common, not dmr_analysis: nyagam/ont-methyldmr-kit:v1.0 (Ubuntu 24.04) has
+    // neither curl nor wget, only tar/mkdir -- confirmed by a real run failing with
+    // "curl: command not found" (exit 127). wf_common already has curl (used
+    // elsewhere in this pipeline), no new image dependency introduced.
+    label "wf_common"
     cpus 1
     memory 2.GB
     output:
