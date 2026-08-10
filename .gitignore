@@ -9,3 +9,4 @@ template-workflow
 work/
 output/
 __pycache__/
+*.log
