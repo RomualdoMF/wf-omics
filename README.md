@@ -2,7 +2,7 @@
 
 PRE-ALFA
 
-All-in-one workflow from base calling to ACMG/AMP classification and/or reports for Single-Nucleotide Variant (SNV), Structural Variant (SV), Copy Number Variation (CNV), Short Tandem Repeats (STR) and Differential Metilation (DMR).
+All-in-one workflow from base calling to ACMG/AMP classification and reports for Single-Nucleotide Variant (SNV), Structural Variant (SV), Copy Number Variation (CNV), Short Tandem Repeats (STR) and Differential Metilation (DMR) and .
 
 ## Introduction
 
@@ -11,19 +11,17 @@ The core of this workflow is based on https://github.com/epi2me-labs/wf-human-va
 This repository contains a [nextflow](https://www.nextflow.io/) workflow for analysing variation in human genomic data. Specifically this workflow can perform the following:
 
 * diploid variant calling
-* structural variant calling
-* analysis of modified base calls
-* copy number variant calling
-* short tandem repeat (STR) expansion genotyping
-* ACMG/AMP classification of SNVs using AutoGVP or Araucaria
-* ACMG/AMP classification of SVs using AnnotSV
-* ACMG/AMP classification of CNVs using ClassifyCNV
-* Differential Metilation with ont-methylDMR-kit
-* Graphical Reports for SNVs using Araucaria
-* Graphical Reports for SVs using KnotAnnotSV
-* Graphical Reports for CNV
-* Graphical Report for DMRs using Methylartist and Modtools
-
+* single nucleotide and small indels variants (SNVs) calling
+* structural variants (SVs) calling
+* modified bases and differentially methylated regions (DMRs) calling
+* copy number variants (CNVs) calling
+* short tandem repeats (STRs) expansion genotyping
+* transposable elements insertions (TEIs) identification
+* pathogenicity prediction (ACMG/AMP classification) of SNVs with TAPES
+* pathogenicity prediction (ACMG/AMP classification) of SVs with AnnotSV
+* pathogenicity prediction (ACMG/AMP classification) of CNVs with AnnotSV/ClassifyCNV/ISV
+* pathogenicity prediction of STRs with STRchive
+* graphical reports for each type of result
 
 <figure>
 <img src="docs/images/wf-omics.drawio.svg" alt="wf-omics overview schematic."/>
