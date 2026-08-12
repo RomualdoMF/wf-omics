@@ -159,7 +159,12 @@ process dmr_calling {
     maxRetries 1
     maxForks 10
     input:
-        tuple val(chr), path(bed1), path(bed2)
+        // bed1/bed2 both come from prep_dmr_bedmethyl (aliased per side -- see
+        // workflows/dmr.nf), which names its output "${chr}__${mod_char}.dss.tsv" --
+        // identical for both sides given the same (chr, mod_char), so without an
+        // explicit stageAs Nextflow refuses to stage both into this task's work dir
+        // ("input file name collision"), caught by a real run.
+        tuple val(chr), path(bed1, stageAs: 'sample1.dss.tsv'), path(bed2, stageAs: 'sample2.dss.tsv')
     output:
         tuple val(chr), path("dmrs_${chr}.bed"), emit: chr_dmrs
         path("dmr_status_${chr}.log"), emit: status_log
