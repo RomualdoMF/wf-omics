@@ -146,18 +146,27 @@ process run_vep {
         def plugin_flags = params.vep_plugin_args.collect { "--plugin ${it}" }.join(' ')
         def out_name = "${xam_meta.alias}.wf_${output_label}.vcf.gz"
         """
+        # --output_file ${out_name} (not STDOUT piped via shell `>`): without --fasta, some
+        # plugins (seen with NMD/UTRAnnotator/CADD-on-indels in particular) make VEP print a
+        # "no FASTA file specified" warning straight to its own STDOUT before --warning_file
+        # even takes effect -- when that STDOUT is a shell pipe into the compressed VCF file
+        # (the old `--output_file STDOUT ... > ${out_name}` form), the warning text corrupts
+        # the bgzip stream and tabix then fails with "tbx_index_build failed". Writing to a
+        # real named output file sidesteps this entirely: VEP's own bgzip writer never shares
+        # a stream with terminal chatter, whatever prints it and regardless of --warning_file.
         if [[ "${genome}" != "hg38" ]] && [[ "${genome}" != "hg19" ]]; then
             cp prepared.vcf.gz ${out_name}
         else
-            vep --input_file prepared.vcf.gz --output_file STDOUT --vcf --compress_output bgzip \
+            vep --input_file prepared.vcf.gz --output_file ${out_name} --vcf --compress_output bgzip \
                 --cache --offline \
                 --dir_cache ${params.vep_cache_dir} --dir_plugins ${params.vep_plugins_dir} \
                 --species ${params.vep_species} --assembly ${assembly} \
                 --cache_version ${params.vep_cache_version} \
                 --fork ${task.cpus} --no_stats --force_overwrite \
                 --sift b --check_existing \
+                --warning_file STDERR \
                 ${custom_flags} ${plugin_flags} ${params.vep_extra_args} \
-                > ${out_name}
+                > vep.log 2>&1
         fi
         tabix -p vcf ${out_name}
         """

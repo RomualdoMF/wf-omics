@@ -36,6 +36,7 @@ include {
     downsampling;
     concat_vcfs as concat_snp_vcfs;
     concat_vcfs as concat_refined_snp;
+    normalize_snp_vcf;
     bed_filter;
     sanitise_bed;
     sanitise_bed as sanitise_coverage_bed;
@@ -51,6 +52,7 @@ include {
 
 include {
     tapes_classify;
+    annotate_snp_vcf_with_tapes;
 } from './modules/local/tapes'
 
 include {
@@ -846,26 +848,40 @@ workflow {
             annotated_vcf = Channel.fromPath("${projectDir}/data/empty_clinvar.vcf")
             // no annotation means no TAPES either (validated at the top of the workflow)
             tapes_table = Channel.empty()
+            annotated_vcf_tuple = Channel.empty()
         }
         else {
+            // bcftools norm -m- splits multiallelic records (and left-aligns indels)
+            // before anything downstream touches the SNP VCF -- VEP's own per-transcript
+            // CSQ blocks cope with multiallelic records fine, but TAPES doesn't (see
+            // normalize_snp_vcf in modules/local/common.nf for the full story). This
+            // normalized VCF is what gets published as wf_snp.vcf.gz now; the
+            // VEP/TAPES-annotated one below is wf_snp.annotated.vcf.gz instead.
+            snp_vcf = normalize_snp_vcf(ref_channel.collect(), final_snp_vcf_filtered).normalized_vcf
+
             // do annotation (functional consequences + ClinVar, both via VEP)
             // snpeff is slow so we'll just pass the whole VCF but annotate per contig
             annotations = annotate_snp_vcf(
-                final_snp_vcf_filtered.combine(clair_vcf.contigs), genome_build.first(), "snp"
+                snp_vcf.combine(clair_vcf.contigs), genome_build.first(), "snp"
             )
-            snp_vcf = concat_snp_vcfs(annotations.map{ meta, vcf, tbi -> [meta,vcf]}.groupTuple(), "wf_snp").final_vcf
-
-            // the report extracts ClinVar rows itself from the VEP CSQ field
-            // of the full annotated VCF (see report_snp.py, load_vep_clinvar_vcf)
-            annotated_vcf = snp_vcf.map{ meta, vcf, tbi -> vcf }
+            vep_annotated_vcf = concat_snp_vcfs(annotations.map{ meta, vcf, tbi -> [meta,vcf]}.groupTuple(), "wf_snp.annotated").final_vcf
 
             // TAPES ACMG classification (see modules/local/tapes.nf), run per-contig on
             // the same pre-concat `annotations` channel above, then merged into one table.
             if (params.tapes) {
                 tapes_table = tapes_classify(annotations, genome_build.first()).table
+                // inject TAPES' Probability_Path/Prediction_ACMG_tapes columns back into
+                // the VEP-annotated VCF as INFO fields -- published wf_snp.annotated.vcf.gz
+                // either way (see annotate_snp_vcf_with_tapes in modules/local/tapes.nf).
+                annotated_vcf_tuple = annotate_snp_vcf_with_tapes(vep_annotated_vcf, tapes_table).annotated_vcf
             } else {
                 tapes_table = Channel.empty()
+                annotated_vcf_tuple = vep_annotated_vcf
             }
+
+            // the report extracts ClinVar rows itself from the VEP CSQ field
+            // of the full annotated VCF (see report_snp.py, load_vep_clinvar_vcf)
+            annotated_vcf = annotated_vcf_tuple.map{ meta, vcf, tbi -> vcf }
         }
 
         // Run vcf statistics on the final VCF file
@@ -884,6 +900,7 @@ workflow {
         snp_report
             .concat(clair3_results)
             .concat(snp_vcf.map{meta, vcf, tbi -> [vcf, tbi]})
+            .concat(annotated_vcf_tuple.map{meta, vcf, tbi -> [vcf, tbi]})
             .concat(tapes_table)
             .flatten() | output_snp
     } else {

@@ -50,6 +50,11 @@ from pathlib import Path
 
 import pysam
 
+# AnnotSV rows for large/complex SVs can pack a huge Gene_name / overlapping-gene
+# list into a single field (seen on real SV calls spanning many genes), well past
+# the csv module's default 131072-byte field limit -- raise it before any TSV read.
+csv.field_size_limit(sys.maxsize)
+
 CANONICAL_COLUMNS = ['Chr', 'Start', 'Stop', 'Type']
 RAW_ANNOTSV_COORD_COLUMNS = ('SV_chrom', 'SV_start', 'SV_end', 'SV_type')
 

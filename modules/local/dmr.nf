@@ -80,7 +80,7 @@ process download_dmr_annotations {
             if [ ! -d "${target}" ]; then
                 curl -L -C - -o "${tarball}" "${url}"
                 mkdir -p "${target}"
-                tar -xzf "${tarball}" -C "${target}"
+                tar -xzf "${tarball}" -C "${target}" --strip-components=1
                 rm -f "${tarball}"
             fi
             rmdir "${lock}" 2>/dev/null || true
