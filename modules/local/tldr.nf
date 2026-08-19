@@ -9,9 +9,15 @@
 // dependencies of tldr itself, not just of the upstream alignment).
 
 process call_tldr {
+    // 8GB (fixed, no retry scaling) was fine for smaller contigs, but larger ones
+    // (e.g. chr4, ~220k read clusters) got OOM-killed (exit 137) with no retry --
+    // no errorStrategy was set here at all, so Nextflow's default ('terminate')
+    // aborted the whole run on the very first failure. Scale with task.attempt.
     label "tldr"
     cpus { params.tldr_procs }
-    memory 8.GB
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_16, task.attempt, params.max_memory) }
+    errorStrategy {task.exitStatus in [137, 140] ? 'retry' : 'finish'}
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_16, params.max_memory) }
     input:
         tuple path(xam), path(xam_idx), val(xam_meta)
         tuple path(ref), path(ref_idx), path(ref_cache), env(REF_PATH)

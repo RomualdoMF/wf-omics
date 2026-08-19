@@ -93,6 +93,11 @@ include {
     dmr_sample_compare;
 } from './workflows/dmr'
 
+include {
+    output_dmr_plots_haplotype_compare;
+    output_dmr_plots_sample_compare;
+} from './modules/local/dmr'
+
 
 
 // entrypoint workflow
@@ -971,7 +976,9 @@ workflow {
         dmr_hap_out = dmr_hap.dmr_table.map { alias, label, mod_char, f -> f }
             .mix(dmr_hap.annotated.map { alias, label, mod_char, f -> f })
             .mix(dmr_hap.report)
-            .mix(dmr_hap.plots)
+        // published under DMR_Imgs/haplotype_compare instead of flat alongside
+        // everything else (see modules/local/dmr.nf output_dmr_plots_haplotype_compare)
+        output_dmr_plots_haplotype_compare(dmr_hap.plots)
     } else {
         dmr_hap_out = Channel.empty()
     }
@@ -990,7 +997,9 @@ workflow {
         dmr_samp_out = dmr_samp.dmr_table.map { alias, label, mod_char, f -> f }
             .mix(dmr_samp.annotated.map { alias, label, mod_char, f -> f })
             .mix(dmr_samp.report)
-            .mix(dmr_samp.plots)
+        // published under DMR_Imgs/sample_compare instead of flat alongside
+        // everything else (see modules/local/dmr.nf output_dmr_plots_sample_compare)
+        output_dmr_plots_sample_compare(dmr_samp.plots)
     } else {
         dmr_samp_out = Channel.empty()
     }

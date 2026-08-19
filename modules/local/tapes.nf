@@ -17,11 +17,15 @@ process run_tapes {
     // AlphaMissense/BayesDel/CADD/PrimateAI/REVEL/MaveDB/UTRAnnotator/SpliceAI/dbscSNV),
     // the per-variant CSQ block and the resulting pandas dataframe are much wider, and
     // TAPES loading its ACMG reference databases on top of that got OOM-killed (exit 137)
-    // on larger contigs (e.g. chr6) at 4GB. Scale with task.attempt for retries too.
+    // on larger contigs (e.g. chr6) at 4GB. Scale with task.attempt for retries too
+    // (see lib/MemoryScaling.groovy) -- and note the errorStrategy below, missing
+    // until now: without it Nextflow's default ('terminate') meant maxRetries had no
+    // effect at all, so a real OOM here would never actually have retried.
     label "tapes"
     cpus 1
-    memory { 16.GB * task.attempt }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_16, task.attempt, params.max_memory) }
+    errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_16, params.max_memory) }
     input:
         tuple val(xam_meta), path(vcf), path(tbi)
         val(genome)
@@ -50,10 +54,12 @@ process merge_tapes {
     // merge the per-contig TAPES tables into one, keeping only the first header --
     // same awk idiom as modules/local/tldr.nf::merge_tldr. Bumped alongside run_tapes
     // above -- the per-contig tables are much wider now too (full VEP plugin set).
+    // Same missing-errorStrategy fix as run_tapes above too.
     label "wf_common"
     cpus 1
-    memory { 8.GB * task.attempt }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_8, task.attempt, params.max_memory) }
+    errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_8, params.max_memory) }
     input:
         path(tables)
         val(xam_meta)

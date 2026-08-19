@@ -2,8 +2,8 @@
 process callCNV {
     label "wf_cnv"
     cpus 1
-    memory { 16.GB * task.attempt }
-    maxRetries 1
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_16, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_16, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
     // publish everything except the cnv_vcf to qdna_seq directory
     publishDir \

@@ -153,10 +153,13 @@ process dmr_calling {
     // params -- same decision upstream made, see its README).
     label "dmr_analysis"
     cpus 4
-    memory 4.GB
+    // was a flat 4.GB regardless of task.attempt, so the retry below never
+    // actually helped an OOM -- scale it like the rest of the pipeline's
+    // OOM-prone processes now (see lib/MemoryScaling.groovy).
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
     time 1.h
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
-    maxRetries 1
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     maxForks 10
     input:
         // bed1/bed2 both come from prep_dmr_bedmethyl (aliased per side -- see
@@ -656,4 +659,36 @@ process plot_phased_dmr_methylartist {
         echo "Total methylartist phased plots generated: \$(cat plot_count.tmp)" >> plot_status.log
         rm -f plot_count.tmp
         """
+}
+
+
+process output_dmr_plots_haplotype_compare {
+    // publish dmr_haplotype_compare's per-region modbamtools/methylartist plots
+    // (H1 vs H2) into their own subdirectory instead of flat in ${params.out_dir}
+    // alongside everything else -- same trivial copy-through as publish_artifact
+    // (modules/local/common.nf), just with a dedicated publishDir.
+    publishDir "${params.out_dir}/DMR_Imgs/haplotype_compare", mode: 'copy', pattern: "*"
+    input:
+        file fname
+    output:
+        file fname
+    script:
+    """
+    echo "Writing haplotype_compare DMR plots"
+    """
+}
+
+
+process output_dmr_plots_sample_compare {
+    // same as output_dmr_plots_haplotype_compare above, for dmr_sample_compare's
+    // plots (sample vs external reference) instead.
+    publishDir "${params.out_dir}/DMR_Imgs/sample_compare", mode: 'copy', pattern: "*"
+    input:
+        file fname
+    output:
+        file fname
+    script:
+    """
+    echo "Writing sample_compare DMR plots"
+    """
 }

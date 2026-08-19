@@ -1,8 +1,3 @@
-def longphase_memory = [8.GB, 32.GB, 56.GB]
-def whatshap_memory = [4.GB, 8.GB, 12.GB]
-def haptag_memory = [4.GB, 8.GB, 12.GB]
-def aggregate_memory = [4.GB, 8.GB, 16.GB]
-
 // As of Clair3 v1.0.6, set `--min_snp_af` and `--min_indel_af` to 0 with `--vcf_fn`.
 def snp_min_af = params.vcf_fn ? "--snp_min_af 0.0": "--snp_min_af ${params.snp_min_af}"
 def indel_min_af = params.vcf_fn ? "--indel_min_af 0.0" : "--indel_min_af ${params.indel_min_af}"
@@ -75,9 +70,9 @@ process pileup_variants {
     // Calls variants per region ("chunk") using pileup network.
     label "wf_human_snp"
     cpus 1
-    memory { ["3.6 GB", "7 GB", "14 GB"][task.attempt - 1] }  // CW-6182
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
     errorStrategy 'retry'
-    maxRetries 2
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     input:
         each region
         tuple path(xam), path(xam_idx), val(xam_meta)
@@ -128,8 +123,8 @@ process aggregate_pileup_variants {
     // to use for phasing.
     label "wf_human_snp"
     cpus 2
-    memory { aggregate_memory[task.attempt - 1] }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
 
     input:
@@ -196,8 +191,8 @@ process phase_contig {
     //   used later in the full-alignment model
     label "longphase"
     cpus 4
-    memory { longphase_memory[task.attempt - 1] }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_8, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_8, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
 
     input:
@@ -336,9 +331,9 @@ process evaluate_candidates {
     // phased_bam just references the input BAM as it no longer contains phase information.
     label "wf_human_snp"
     cpus 1
-    memory { ["3.6 GB", "7 GB", "29 GB"][task.attempt - 1] }  // CW-5461, CW-6182
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
     errorStrategy 'retry'
-    maxRetries 2
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
 
     input:
         tuple val(contig), path(phased_xam), path(phased_xai), val(xam_meta), path(phased_vcf)
@@ -378,8 +373,8 @@ process aggregate_full_align_variants {
     // Sort and merge all "full alignment" variants
     label "wf_human_snp"
     cpus 2
-    memory { aggregate_memory[task.attempt - 1] }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
 
     input:
@@ -466,8 +461,8 @@ process post_clair_phase_contig {
     // CW-2383: now uses base image to allow phasing of both snps and indels
     cpus 1
     // Define memory from phasing tool and number of attempt
-    memory { whatshap_memory[task.attempt - 1] }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
 
     input:
@@ -509,8 +504,8 @@ process post_clair_contig_haplotag {
 
     cpus 4
     // Define memory from phasing tool and number of attempt
-    memory { haptag_memory[task.attempt - 1] }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
 
     input:
@@ -542,8 +537,8 @@ process post_clair_contig_haplotag {
 process aggregate_all_variants{
     label "wf_human_snp"
     cpus 4
-    memory { 8.GB * task.attempt }
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_8, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_8, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
     input:
         tuple path(ref), path(ref_idx), path(ref_cache), env(REF_PATH)
@@ -601,8 +596,8 @@ process aggregate_all_variants{
 process refine_with_sv {
     label "wf_human_snp"
     cpus 4
-    memory { 8.GB * task.attempt - 1.GB }
-    maxRetries 1
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_8, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_8, params.max_memory) }
     errorStrategy {task.exitStatus in [1,137,140] ? 'retry' : 'finish'}
 
     input:

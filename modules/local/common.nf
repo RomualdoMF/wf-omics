@@ -1,8 +1,8 @@
 //NOTE grep MOSDEPTH_TUPLE if changing output tuple
 process mosdepth {
     cpus 4
-    memory {4.GB * task.attempt}
-    maxRetries 2
+    memory { MemoryScaling.forAttempt(MemoryScaling.SERIES_4, task.attempt, params.max_memory) }
+    maxRetries { MemoryScaling.retriesNeeded(MemoryScaling.SERIES_4, params.max_memory) }
     errorStrategy {task.exitStatus in [137,140] ? 'retry' : 'finish'}
     input:
         tuple path(xam), path(xam_idx), val(xam_meta)
